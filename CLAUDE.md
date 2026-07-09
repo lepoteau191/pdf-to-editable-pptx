@@ -49,3 +49,19 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
   URLパスから来る`job_id`は、ファイルパスに使う前に必ず`uuid.UUID()`で検証する
   （パストラバーサル対策。app.pyの`_job_dir_for()`参照）。
 - `jobs/`はgitignore対象（アップロードPDF・生成PPTXは秘密情報になりうる）。コミットしない。
+- ダウンロード直前は必ず `app._validate_output_for_download()` を通す（symlink拒否・
+  resolve()がjob_dir配下か確認・zipfile.is_zipfileで検証）。output.pptxを直接
+  `FileResponse`に渡さない。
+- 変換失敗時、`status.json`の`message`は常に固定文（`app.GENERIC_CONVERSION_ERROR_MESSAGE`）。
+  worker.pyの生の標準エラー出力（内部パスを含みうる）は`internal_error`にのみ記録し、
+  `app._public_status()`でAPIレスポンスから必ず除外する。新しくエラー系のフィールドを
+  追加するときも、内部詳細を安易にAPIへ直接返さないこと。
+- アップロード元ファイル名・ダウンロード提示名は必ず長さ上限
+  （`MAX_ORIGINAL_FILENAME_LENGTH` / `MAX_DOWNLOAD_STEM_LENGTH`）で切り詰める
+  （Content-Dispositionの肥大化防止）。
+- janitor.pyはUUID形式でないディレクトリ・status.json内job_id不一致のディレクトリを
+  skipし、queued/processingは`--stale-timeout-hours`を超えるまで削除しない。
+  `shutil.rmtree`の失敗は`ignore_errors=True`で握り潰さず警告として返す。
+- 公開用ジョブキュー（Celery/RQ/Arq等）・worker完全分離・rate limit・認証・
+  同時実行数制限・jobs総容量制限はPhase 0.3以降。今のapp.pyのBackgroundTasksは
+  ローカルMVP専用で、それらの代替にはならない。

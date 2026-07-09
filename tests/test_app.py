@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import io
+import json
 import time
 import uuid
 import zipfile
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -180,7 +182,7 @@ def test_conversion_failure_sets_error_status(client, tmp_path, monkeypatch):
 
     data = _wait_for_terminal(client, job_id)
     assert data["status"] == "error"
-    assert "疑似的な失敗" in data["message"]
+    assert data["message"] == app_module.GENERIC_CONVERSION_ERROR_MESSAGE
 
     dl = client.get(f"/jobs/{job_id}/download")
     assert dl.status_code == 409
@@ -205,3 +207,166 @@ def test_debug_dir_is_never_forwarded_to_worker(client, tmp_path, monkeypatch):
 
     assert "debug_dir" in captured
     assert captured["debug_dir"] is None
+
+
+# ---------------------------------------------------------------------------
+# エラーメッセージのパス秘匿
+# ---------------------------------------------------------------------------
+
+def test_error_message_does_not_leak_internal_details(client, tmp_path, monkeypatch):
+    """内部パスやスタックトレースがAPIレスポンスに出ないこと。"""
+    leaky_detail = "/private/var/tmp/pdf2pptx_worker_x7z/output.pptx で権限エラー"
+
+    def _fail(*args, **kwargs):
+        return 1, "", f"エラー: {leaky_detail}"
+
+    monkeypatch.setattr(app_module.worker, "run_with_hard_timeout", _fail)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload", files={"file": ("in.pdf", content, "application/pdf")}
+    )
+    job_id = res.json()["job_id"]
+    data = _wait_for_terminal(client, job_id)
+
+    assert data["status"] == "error"
+    assert data["message"] == app_module.GENERIC_CONVERSION_ERROR_MESSAGE
+    assert "internal_error" not in data
+    assert "/private/var/tmp" not in json.dumps(data)
+    assert "pdf2pptx_worker_x7z" not in json.dumps(data)
+
+    # ジョブディレクトリ内には内部詳細が記録されている(運用者向け)ことも確認する
+    job_dir = app_module.JOBS_ROOT / job_id
+    raw = app_module._read_status(job_dir)
+    assert leaky_detail in raw["internal_error"]
+
+
+def test_unexpected_exception_error_does_not_leak_details(client, tmp_path, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("/etc/passwd を読めませんでした")
+
+    monkeypatch.setattr(app_module.worker, "run_with_hard_timeout", _boom)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload", files={"file": ("in.pdf", content, "application/pdf")}
+    )
+    job_id = res.json()["job_id"]
+    data = _wait_for_terminal(client, job_id)
+
+    assert data["status"] == "error"
+    assert data["message"] == app_module.GENERIC_CONVERSION_ERROR_MESSAGE
+    assert "internal_error" not in data
+    assert "/etc/passwd" not in json.dumps(data)
+
+
+# ---------------------------------------------------------------------------
+# ダウンロードAPIの安全化
+# ---------------------------------------------------------------------------
+
+def _make_done_job(client, tmp_path, job_id: str | None = None) -> str:
+    """status.jsonだけを直接書いて「完了」状態のジョブディレクトリを作る。
+
+    output.pptxの内容/種類はテストごとに個別に用意するため、ここでは
+    status.jsonの作成とディレクトリ準備だけを行う。
+    """
+    job_id = job_id or str(uuid.uuid4())
+    job_dir = app_module.JOBS_ROOT / job_id
+    job_dir.mkdir(parents=True)
+    app_module._write_status(
+        job_dir,
+        job_id=job_id,
+        status="done",
+        original_filename="in.pdf",
+        created_at="2026-01-01T00:00:00+00:00",
+        message=None,
+        warnings=[],
+    )
+    return job_id
+
+
+def test_download_rejects_symlink_output(client, tmp_path):
+    job_id = _make_done_job(client, tmp_path)
+    job_dir = app_module.JOBS_ROOT / job_id
+
+    real_target = tmp_path / "elsewhere.pptx"
+    with zipfile.ZipFile(real_target, "w") as zf:
+        zf.writestr("dummy.txt", "hello")
+    (job_dir / "output.pptx").symlink_to(real_target)
+
+    dl = client.get(f"/jobs/{job_id}/download")
+    assert dl.status_code == 500
+    assert "symlink" not in dl.json()["detail"]  # 詳細はログのみ、レスポンスは固定文
+
+
+def test_download_rejects_output_outside_job_dir(tmp_path):
+    """resolve()結果がjob_dirの配下でない場合は拒否する。
+
+    通常のdownload_jobエンドポイントではjob_dir配下のoutput.pptxしか渡らないが
+    （symlinkでない限りresolve結果がjob_dir外になることはない）、この検査自体を
+    独立して確認するため _validate_output_for_download を直接呼び出す。
+    """
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    outside_file = tmp_path / "outside.pptx"
+    with zipfile.ZipFile(outside_file, "w") as zf:
+        zf.writestr("dummy.txt", "hello")
+
+    with pytest.raises(HTTPException) as exc_info:
+        app_module._validate_output_for_download(job_dir, outside_file)
+    assert exc_info.value.status_code == 500
+
+
+def test_download_rejects_invalid_zip(client, tmp_path):
+    job_id = _make_done_job(client, tmp_path)
+    job_dir = app_module.JOBS_ROOT / job_id
+    (job_dir / "output.pptx").write_bytes(b"this is not a valid pptx/zip")
+
+    dl = client.get(f"/jobs/{job_id}/download")
+    assert dl.status_code == 500
+
+
+def test_download_succeeds_for_valid_output(client, tmp_path):
+    """正常系: symlinkでもなくjob_dir内の正しいzipなら通常通りダウンロードできる。"""
+    job_id = _make_done_job(client, tmp_path)
+    job_dir = app_module.JOBS_ROOT / job_id
+    with zipfile.ZipFile(job_dir / "output.pptx", "w") as zf:
+        zf.writestr("dummy.txt", "hello")
+
+    dl = client.get(f"/jobs/{job_id}/download")
+    assert dl.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# ファイル名長さ制限
+# ---------------------------------------------------------------------------
+
+def test_long_original_filename_is_truncated_on_upload(client, tmp_path):
+    long_stem = "あ" * 400
+    filename = f"{long_stem}.pdf"
+    content = _pdf_bytes(tmp_path)
+
+    res = client.post(
+        "/upload", files={"file": (filename, content, "application/pdf")}
+    )
+    assert res.status_code == 202
+    job_id = res.json()["job_id"]
+
+    status = client.get(f"/jobs/{job_id}").json()
+    assert len(status["original_filename"]) <= app_module.MAX_ORIGINAL_FILENAME_LENGTH
+    assert status["original_filename"].endswith(".pdf")
+
+
+def test_download_filename_stem_is_truncated(client):
+    huge_name = "x" * 500 + ".pdf"
+    truncated = app_module._safe_download_name(huge_name)
+    stem = truncated.removesuffix(".pptx")
+    assert len(stem) <= app_module.MAX_DOWNLOAD_STEM_LENGTH
+    assert truncated.endswith(".pptx")
+
+
+def test_truncate_original_filename_preserves_extension():
+    name = "y" * 300 + ".pdf"
+    truncated = app_module._truncate_original_filename(name)
+    assert len(truncated) <= app_module.MAX_ORIGINAL_FILENAME_LENGTH
+    assert truncated.endswith(".pdf")

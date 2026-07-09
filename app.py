@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,11 +50,28 @@ MAX_UPLOAD_BYTES = int(MAX_UPLOAD_SIZE_MB * 1024 * 1024)
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 HARD_TIMEOUT_SECONDS = worker.DEFAULT_HARD_TIMEOUT
 
+# 保存するファイル名・提示するダウンロード名の長さ上限。
+# Content-Dispositionヘッダの肥大化や、極端に長いファイル名によるOS依存の
+# 問題を避けるため、表示用の値は常にこの範囲に切り詰める。
+MAX_ORIGINAL_FILENAME_LENGTH = 255
+MAX_DOWNLOAD_STEM_LENGTH = 180
+
+# 変換失敗時にAPI/UIへ返す固定の安全なメッセージ。実際のエラー詳細
+# （worker.pyの標準エラー出力。一時ディレクトリ等の内部パスを含みうる）は
+# status.jsonの internal_error にのみ記録し、APIレスポンスには含めない。
+GENERIC_CONVERSION_ERROR_MESSAGE = (
+    "変換に失敗しました。ファイルを確認するか、時間をおいてもう一度お試しください。"
+)
+
 PPTX_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 )
 STATUS_FILENAME = "status.json"
 JOB_STATUSES = ("queued", "processing", "done", "error")
+
+# status.json内にあってもAPIレスポンスには含めないフィールド
+# （internal_errorには内部パス等を含みうる生のエラー詳細が入るため）。
+_INTERNAL_ONLY_FIELDS = {"internal_error"}
 
 app = FastAPI(title="pdf2pptx Web MVP (ローカル専用)")
 
@@ -88,6 +106,15 @@ def _read_status(job_dir: Path) -> dict:
         raise HTTPException(status_code=404, detail="ジョブが見つかりません")
 
 
+def _public_status(data: dict) -> dict:
+    """APIレスポンスとして返して良いフィールドだけに絞る。
+
+    internal_error（worker.pyの生の標準エラー出力。一時ディレクトリ等の
+    内部パスを含みうる）は絶対に外部へ返さない。
+    """
+    return {k: v for k, v in data.items() if k not in _INTERNAL_ONLY_FIELDS}
+
+
 def _write_status(job_dir: Path, **updates) -> None:
     """status.jsonを既存内容とマージしてアトミックに書き込む。
 
@@ -114,10 +141,25 @@ def _write_status(job_dir: Path, **updates) -> None:
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._\-ぁ-んァ-ヶ一-龥ー]")
 
 
+def _truncate_original_filename(name: str) -> str:
+    """アップロード元のファイル名を保存用に切り詰める（拡張子は保持する）。
+
+    Content-Dispositionヘッダの肥大化や、極端に長い値がstatus.jsonや
+    ログに残り続けることを避けるための上限。
+    """
+    if len(name) <= MAX_ORIGINAL_FILENAME_LENGTH:
+        return name
+    p = Path(name)
+    suffix = p.suffix
+    stem_budget = max(MAX_ORIGINAL_FILENAME_LENGTH - len(suffix), 1)
+    return p.stem[:stem_budget] + suffix
+
+
 def _safe_download_name(original_filename: str | None) -> str:
     """ダウンロード時に提示するファイル名を作る（表示用のみ・パスには使わない）。"""
     stem = Path(original_filename or "output").stem
     stem = _SAFE_NAME_RE.sub("_", stem).strip("._") or "output"
+    stem = stem[:MAX_DOWNLOAD_STEM_LENGTH].strip("._") or "output"
     return f"{stem}.pptx"
 
 
@@ -149,10 +191,13 @@ async def _save_upload_streaming(file: UploadFile, dest: Path) -> None:
 @app.post("/upload", status_code=202)
 async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     original_name = file.filename or "upload.pdf"
+    # 拡張子の判定は元のファイル名で行う（切り詰めた後だと拡張子を
+    # 巻き込んでしまい、長いファイル名の正当なPDFを誤って拒否しうるため）。
     if Path(original_name).suffix.lower() != ALLOWED_EXTENSION:
         raise HTTPException(
             status_code=400, detail="PDFファイル(.pdf)のみアップロードできます"
         )
+    original_name = _truncate_original_filename(original_name)
 
     job_id = str(uuid.uuid4())
     job_dir = JOBS_ROOT / job_id
@@ -205,9 +250,18 @@ def _run_conversion_job(job_id: str) -> None:
             debug_dir=None,  # Web経由では常に無効
         )
     except Exception as e:  # noqa: BLE001 - ジョブを必ずerror状態へ遷移させる
-        _write_status(job_dir, status="error", message=f"内部エラー: {e}", warnings=[])
+        _write_status(
+            job_dir,
+            status="error",
+            message=GENERIC_CONVERSION_ERROR_MESSAGE,
+            internal_error=f"{type(e).__name__}: {e}",
+            warnings=[],
+        )
         return
 
+    # 警告(convert.pyが安全に設計した固定形式の文言。パスは含まない)は
+    # そのまま利用者に見せてよい。一方でエラー詳細(stderr)は一時ディレクトリ
+    # 等の内部パスを含みうるため、internal_errorにのみ記録しAPIには出さない。
     warning_lines = [
         line[len("警告: "):] for line in stderr.splitlines() if line.startswith("警告: ")
     ]
@@ -216,8 +270,14 @@ def _run_conversion_job(job_id: str) -> None:
         _write_status(job_dir, status="done", message=None, warnings=warning_lines)
     else:
         error_lines = [line for line in stderr.splitlines() if line.startswith("エラー:")]
-        message = error_lines[-1] if error_lines else (stderr.strip() or "変換に失敗しました")
-        _write_status(job_dir, status="error", message=message, warnings=warning_lines)
+        internal_detail = error_lines[-1] if error_lines else (stderr.strip() or "変換に失敗しました")
+        _write_status(
+            job_dir,
+            status="error",
+            message=GENERIC_CONVERSION_ERROR_MESSAGE,
+            internal_error=internal_detail,
+            warnings=warning_lines,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +289,51 @@ def get_job(job_id: str):
     job_dir = _job_dir_for(job_id)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="ジョブが見つかりません")
-    return _read_status(job_dir)
+    return _public_status(_read_status(job_dir))
+
+
+def _reject_unsafe_download(reason: str) -> None:
+    """出力ファイルの安全性チェックに失敗した場合の共通エラー。
+
+    reason（内部パスやsymlinkの指す先を含みうる）はサーバーログにのみ出し、
+    APIレスポンスには含めない。呼び出し元からは常に例外として抜ける。
+    """
+    print(f"[download] 出力ファイルの検証に失敗しました: {reason}")
+    raise HTTPException(
+        status_code=500,
+        detail="出力ファイルを確認できませんでした。時間をおいて再度お試しください。",
+    )
+
+
+def _validate_output_for_download(job_dir: Path, output_path: Path) -> Path:
+    """ダウンロード対象ファイルの安全性を検査し、resolve済みの実パスを返す。
+
+    以下はworker.pyの正常なアトミック置換(os.replace)では起こらないはずだが、
+    万一の細工・競合・バグに備えた防御的チェック。ダウンロード直前に必ず行う。
+      - symlinkでないこと
+      - 実在すること
+      - resolve()した実パスがjob_dirの配下であること
+      - zipとして開けること（pptxはzip形式のため）
+    """
+    if output_path.is_symlink():
+        _reject_unsafe_download(f"output.pptxがsymlinkです: {output_path}")
+    if not output_path.exists():
+        _reject_unsafe_download(f"出力ファイルが存在しません: {output_path}")
+
+    try:
+        resolved_output = output_path.resolve(strict=True)
+        resolved_job_dir = job_dir.resolve(strict=True)
+    except OSError:
+        _reject_unsafe_download(f"出力ファイルのresolveに失敗しました: {output_path}")
+
+    if not resolved_output.is_relative_to(resolved_job_dir):
+        _reject_unsafe_download(
+            f"出力ファイルがジョブディレクトリ外を指しています: {resolved_output}"
+        )
+    if not zipfile.is_zipfile(resolved_output):
+        _reject_unsafe_download(f"出力ファイルがzipとして不正です: {resolved_output}")
+
+    return resolved_output
 
 
 @app.get("/jobs/{job_id}/download")
@@ -245,12 +349,10 @@ def download_job(job_id: str):
             detail=f"まだダウンロードできません（状態: {status.get('status')}）",
         )
 
-    output_path = job_dir / "output.pptx"
-    if not output_path.exists():
-        raise HTTPException(status_code=500, detail="出力ファイルが見つかりません")
+    resolved_output = _validate_output_for_download(job_dir, job_dir / "output.pptx")
 
     return FileResponse(
-        output_path,
+        resolved_output,
         media_type=PPTX_MEDIA_TYPE,
         filename=_safe_download_name(status.get("original_filename")),
     )
