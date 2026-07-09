@@ -25,6 +25,9 @@ build/
 # --- データ ---
 data/
 
+# --- Webアプリのジョブ成果物（アップロードPDF・生成PPTX） ---
+jobs/
+
 # --- OS / エディタ ---
 .DS_Store
 .idea/

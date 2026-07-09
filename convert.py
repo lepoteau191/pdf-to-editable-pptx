@@ -606,11 +606,12 @@ def _check_positive(name: str, value: float) -> None:
         raise ValueError(f"{name} は正の値である必要があります: {value}")
 
 
-def _looks_like_pdf(path: Path) -> bool:
+def looks_like_pdf(path: Path) -> bool:
     """先頭付近に %PDF- マジックバイトがあるかを確認する（簡易な入力検証）。
 
     PDF仕様上、ヘッダの前に最大1024バイト程度のゴミが許容されるため、
-    先頭1024バイトの範囲で探す。
+    先頭1024バイトの範囲で探す。app.py（Webアップロード時の検証）からも
+    再利用するため公開関数にしている。
     """
     try:
         with open(path, "rb") as f:
@@ -679,7 +680,7 @@ def convert(
             f"入力PDFが大きすぎます: {file_size_mb:.1f}MB (上限 {max_file_size_mb}MB)"
         )
 
-    if not _looks_like_pdf(input_pdf):
+    if not looks_like_pdf(input_pdf):
         raise ValueError(
             f"入力ファイルがPDFではないようです（%PDFヘッダが見つかりません）: {input_pdf}"
         )

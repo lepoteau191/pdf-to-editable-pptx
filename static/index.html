@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pdf2pptx（ローカルMVP）</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --text: #1b1f24;
+    --muted: #6b7280;
+    --border: #e2e4e8;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --err: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --card: #1e2126;
+      --text: #e7e9ec;
+      --muted: #9aa1ac;
+      --border: #2c3038;
+      --accent: #4f8cff;
+      --accent-hover: #6ea0ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic",
+      "Segoe UI", sans-serif;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+  h1 {
+    font-size: 1.25rem;
+    margin: 0 0 4px;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0 0 24px;
+  }
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 28px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .dropzone.dragover { border-color: var(--accent); }
+  .dropzone input[type="file"] { display: none; }
+  .dropzone p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .filename {
+    margin-top: 10px;
+    font-size: 0.85rem;
+    color: var(--text);
+    word-break: break-all;
+  }
+  button {
+    width: 100%;
+    margin-top: 16px;
+    padding: 12px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status {
+    margin-top: 20px;
+    padding: 14px;
+    border-radius: 10px;
+    background: rgba(127, 127, 127, 0.08);
+    font-size: 0.88rem;
+    display: none;
+  }
+  .status.visible { display: block; }
+  .status-line { display: flex; align-items: flex-start; gap: 8px; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    margin-top: 6px;
+    background: var(--muted); flex: none;
+  }
+  .dot.processing { background: var(--warn); }
+  .dot.done { background: var(--ok); }
+  .dot.error { background: var(--err); }
+  .warnings {
+    margin: 10px 0 0;
+    padding-left: 18px;
+    color: var(--warn);
+    font-size: 0.8rem;
+  }
+  .error-message { color: var(--err); margin-top: 8px; font-size: 0.85rem; }
+  a.download {
+    display: none;
+    margin-top: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  a.download:not([hidden]) { display: inline-block; }
+  a.download:hover { text-decoration: underline; }
+  footer {
+    margin-top: 20px;
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>pdf2pptx</h1>
+    <p class="subtitle">PDFを編集可能なPPTXに変換します（ローカル専用MVP）</p>
+
+    <label class="dropzone" id="dropzone">
+      <input type="file" id="file-input" accept="application/pdf,.pdf">
+      <p id="dropzone-text">クリックしてPDFを選択、またはドラッグ&ドロップ</p>
+      <div class="filename" id="filename"></div>
+    </label>
+
+    <button id="upload-btn" disabled>アップロードして変換</button>
+
+    <div class="status" id="status">
+      <div class="status-line">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">-</span>
+      </div>
+      <ul class="warnings" id="warnings" hidden></ul>
+      <div class="error-message" id="error-message" hidden></div>
+      <a class="download" id="download-link" href="#" hidden>PPTXをダウンロード</a>
+    </div>
+
+    <footer>ローカル専用MVP。認証・保存期限管理はありません。</footer>
+  </div>
+
+<script>
+const fileInput = document.getElementById("file-input");
+const dropzone = document.getElementById("dropzone");
+const dropzoneText = document.getElementById("dropzone-text");
+const filenameEl = document.getElementById("filename");
+const uploadBtn = document.getElementById("upload-btn");
+const statusEl = document.getElementById("status");
+const statusDot = document.getElementById("status-dot");
+const statusText = document.getElementById("status-text");
+const warningsEl = document.getElementById("warnings");
+const errorMessageEl = document.getElementById("error-message");
+const downloadLink = document.getElementById("download-link");
+
+let selectedFile = null;
+let pollTimer = null;
+
+const STATUS_LABEL = {
+  queued: "待機中…",
+  processing: "変換中…",
+  done: "完了しました",
+  error: "エラーが発生しました",
+};
+
+function resetResultUI() {
+  warningsEl.hidden = true;
+  warningsEl.innerHTML = "";
+  errorMessageEl.hidden = true;
+  errorMessageEl.textContent = "";
+  downloadLink.hidden = true;
+}
+
+fileInput.addEventListener("change", () => {
+  selectedFile = fileInput.files[0] || null;
+  filenameEl.textContent = selectedFile ? selectedFile.name : "";
+  uploadBtn.disabled = !selectedFile;
+});
+
+["dragover", "dragleave", "drop"].forEach((evt) => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.toggle("dragover", evt === "dragover");
+  });
+});
+dropzone.addEventListener("drop", (e) => {
+  const dropped = e.dataTransfer.files[0];
+  if (dropped) {
+    fileInput.files = e.dataTransfer.files;
+    selectedFile = dropped;
+    filenameEl.textContent = dropped.name;
+    uploadBtn.disabled = false;
+  }
+});
+
+uploadBtn.addEventListener("click", async () => {
+  if (!selectedFile) return;
+  if (pollTimer) clearInterval(pollTimer);
+  resetResultUI();
+  uploadBtn.disabled = true;
+  statusEl.classList.add("visible");
+  statusDot.className = "dot";
+  statusText.textContent = "アップロード中…";
+
+  const form = new FormData();
+  form.append("file", selectedFile);
+
+  let res;
+  try {
+    res = await fetch("/upload", { method: "POST", body: form });
+  } catch (e) {
+    statusDot.className = "dot error";
+    statusText.textContent = "アップロードに失敗しました（通信エラー）";
+    uploadBtn.disabled = false;
+    return;
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    statusDot.className = "dot error";
+    statusText.textContent = body.detail || `アップロードに失敗しました (${res.status})`;
+    uploadBtn.disabled = false;
+    return;
+  }
+
+  const { job_id } = await res.json();
+  pollTimer = setInterval(() => pollStatus(job_id), 1200);
+  pollStatus(job_id);
+});
+
+async function pollStatus(jobId) {
+  let res;
+  try {
+    res = await fetch(`/jobs/${jobId}`);
+  } catch (e) {
+    return; // 一時的な通信エラーは次のポーリングに任せる
+  }
+  if (!res.ok) {
+    clearInterval(pollTimer);
+    statusDot.className = "dot error";
+    statusText.textContent = "ジョブ状態の取得に失敗しました";
+    uploadBtn.disabled = false;
+    return;
+  }
+  const data = await res.json();
+  statusDot.className = `dot ${data.status}`;
+  statusText.textContent = STATUS_LABEL[data.status] || data.status;
+
+  if (data.warnings && data.warnings.length) {
+    warningsEl.hidden = false;
+    warningsEl.innerHTML = data.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("");
+  }
+
+  if (data.status === "done") {
+    clearInterval(pollTimer);
+    downloadLink.href = `/jobs/${jobId}/download`;
+    downloadLink.hidden = false;
+    uploadBtn.disabled = false;
+  } else if (data.status === "error") {
+    clearInterval(pollTimer);
+    errorMessageEl.hidden = false;
+    errorMessageEl.textContent = data.message || "変換に失敗しました";
+    uploadBtn.disabled = false;
+  }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+</script>
+</body>
+</html>
