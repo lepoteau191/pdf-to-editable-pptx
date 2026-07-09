@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pymupdf
@@ -181,15 +182,206 @@ def test_mixed_page_sizes_warns(tmp_path):
     assert any(fx.MIXED_P2_TEXT in t for t in _textbox_map(prs.slides[1]))
 
 
-def test_page_with_rotate_attribute(tmp_path):
-    """/Rotate 90 付きページでも座標系が破綻しない（redaction漏れなし）。"""
+def test_rotated_page_falls_back_to_background(tmp_path):
+    """/Rotate 90 付きページはPhase 1では編集対象にせず背景画像のみにする。"""
     pdf = tmp_path / "rot.pdf"
     pptx = tmp_path / "rot.pptx"
     fx.make_rotated_page_pdf(pdf)
     warnings = convert.convert(pdf, pptx)
-    assert not any("redaction" in w for w in warnings)
     slide = Presentation(pptx).slides[0]
-    assert any(fx.ROTATED_PAGE_TEXT in t for t in _textbox_map(slide))
+    assert not any(fx.ROTATED_PAGE_TEXT in t for t in _textbox_map(slide))
+    assert len(slide.shapes) == 1  # 背景画像のみ（テキストボックスなし）
+    assert any("回転" in w for w in warnings)
+    assert not any("redaction" in w for w in warnings)
+
+
+def test_small_page_not_enlarged(tmp_path):
+    """ページ1より小さいページは拡大せず、実寸のまま中央配置する。"""
+    pdf = tmp_path / "small_mixed.pdf"
+    pptx = tmp_path / "small_mixed.pptx"
+    fx.make_small_mixed_pdf(pdf)
+    warnings = convert.convert(pdf, pptx)
+    assert any("拡大" in w for w in warnings)
+
+    slide2 = Presentation(pptx).slides[1]
+    pics = [s for s in slide2.shapes if s.shape_type == 13]
+    assert len(pics) == 1
+    assert pics[0].width == convert._pt_to_emu(200)
+    assert pics[0].height == convert._pt_to_emu(100)
+    # 中央配置なので原点(0,0)には置かれない
+    assert pics[0].left > 0 and pics[0].top > 0
+    assert any(fx.SMALL_PAGE_TEXT in t for t in _textbox_map(slide2))
+
+
+# ---------------------------------------------------------------------------
+# 不可視OCRテキスト
+# ---------------------------------------------------------------------------
+
+def test_invisible_ocr_text_not_editable(tmp_path):
+    """不可視OCRテキスト層のみのページは背景画像のみ+警告になる（可視の二重化防止）。"""
+    pdf = tmp_path / "ocr.pdf"
+    pptx = tmp_path / "ocr.pptx"
+    fx.make_invisible_ocr_pdf(pdf)
+    warnings = convert.convert(pdf, pptx)
+
+    slide = Presentation(pptx).slides[0]
+    assert len(slide.shapes) == 1  # 背景画像のみ
+    assert not any(fx.OCR_INVISIBLE_TEXT in t for t in _textbox_map(slide))
+    assert any("不可視" in w for w in warnings)
+
+
+def test_is_invisible_detects_alpha_zero_and_render_mode3():
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=200)
+    page.insert_text((10, 50), "visible", fontname="helv", fontsize=12)
+    page.insert_text((10, 80), "transparent", fontname="helv", fontsize=12, fill_opacity=0)
+    page.insert_text((10, 110), "rendermode3", fontname="helv", fontsize=12, render_mode=3)
+    d = convert._get_text_dict(page)
+    spans = [
+        s
+        for b in d["blocks"] if b["type"] == 0
+        for l in b["lines"]
+        for s in l["spans"]
+    ]
+    doc.close()
+    by_text = {s["text"].strip(): s for s in spans}
+    assert convert._is_invisible(by_text["visible"]) is False
+    assert convert._is_invisible(by_text["transparent"]) is True
+    assert convert._is_invisible(by_text["rendermode3"]) is True
+
+
+# ---------------------------------------------------------------------------
+# フォールバック文字との重なり
+# ---------------------------------------------------------------------------
+
+def test_overlapping_horizontal_text_left_in_background(tmp_path):
+    """回転テキストとbboxが重なる横書き行はredactionせず背景に残す。
+
+    重ならない通常行は従来通り編集可能になる（過剰な除外になっていないこと）。
+    """
+    pdf = tmp_path / "overlap.pdf"
+    pptx = tmp_path / "overlap.pptx"
+    fx.make_overlap_pdf(pdf)
+    warnings = convert.convert(pdf, pptx)
+
+    slide = Presentation(pptx).slides[0]
+    boxes = _textbox_map(slide)
+    assert not any(fx.OVERLAP_HORIZONTAL_TEXT in t for t in boxes)
+    assert not any(fx.OVERLAP_ROTATED_TEXT in t for t in boxes)
+    assert any(fx.OVERLAP_NORMAL_TEXT in t for t in boxes)
+    assert any("重なる" in w for w in warnings)
+    assert not any("redaction" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# 入出力パス防御
+# ---------------------------------------------------------------------------
+
+def test_convert_rejects_same_input_output_path(tmp_path):
+    pdf = tmp_path / "same.pdf"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="同じパス"):
+        convert.convert(pdf, pdf)
+    # 入力ファイルが破壊されていないこと
+    assert pymupdf.open(pdf).page_count == 3
+
+
+def test_cli_rejects_same_input_output_path(tmp_path):
+    pdf = tmp_path / "same.pdf"
+    fx.make_business_pdf(pdf)
+    res = subprocess.run(
+        [sys.executable, str(ROOT / "convert.py"), str(pdf), str(pdf)],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 1
+    assert pymupdf.open(pdf).page_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Web公開前提の基本制限
+# ---------------------------------------------------------------------------
+
+def test_max_pages_exceeded(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)  # 3ページ
+    with pytest.raises(ValueError, match="ページ数"):
+        convert.convert(pdf, pptx, max_pages=2)
+
+
+def test_max_dpi_exceeded(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="dpi"):
+        convert.convert(pdf, pptx, dpi=500, max_dpi=300)
+
+
+def test_max_file_size_exceeded(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="大きすぎます"):
+        convert.convert(pdf, pptx, max_file_size_mb=0.0)
+
+
+def test_max_page_pixels_exceeded(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="大きすぎます"):
+        convert.convert(pdf, pptx, max_page_pixels=100)
+
+
+def test_timeout_exceeded(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(TimeoutError):
+        convert.convert(pdf, pptx, timeout_seconds=0.0)
+
+
+def test_within_limits_still_succeeds(tmp_path):
+    """既定の制限は通常のビジネス文書PDFを妨げない。"""
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    warnings = convert.convert(pdf, pptx)
+    assert pptx.exists()
+    assert not any("大きすぎます" in w or "上限" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# 画像が多いPDFでのget_text負荷
+# ---------------------------------------------------------------------------
+
+def test_image_heavy_pdf_text_dict_excludes_images(tmp_path):
+    """TEXT_PRESERVE_IMAGESを外しているため、画像ブロックが混入しない。"""
+    pdf = tmp_path / "images.pdf"
+    fx.make_image_heavy_pdf(pdf, n_images=15)
+    doc = pymupdf.open(pdf)
+    page = doc[0]
+
+    start = time.monotonic()
+    d = convert._get_text_dict(page)
+    elapsed = time.monotonic() - start
+
+    assert not any(b["type"] == 1 for b in d["blocks"])  # 画像ブロックが無い
+    assert elapsed < 3.0  # 画像埋め込みがあれば大幅に遅くなるはずの緩い上限
+
+    lines, _ = convert.extract_editable_lines(page, text_dict=d)
+    assert any(fx.PAGE2_BODY in "".join(s["text"] for s in line.spans) for line in lines)
+    doc.close()
+
+
+def test_image_heavy_pdf_converts_correctly(tmp_path):
+    pdf = tmp_path / "images.pdf"
+    pptx = tmp_path / "images.pptx"
+    fx.make_image_heavy_pdf(pdf, n_images=15)
+    warnings = convert.convert(pdf, pptx)
+    slide = Presentation(pptx).slides[0]
+    assert any(fx.PAGE2_BODY in t for t in _textbox_map(slide))
+    assert not any("redaction" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------

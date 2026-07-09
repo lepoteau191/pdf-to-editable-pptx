@@ -2,11 +2,18 @@
 """pdf2pptx — PDFを編集可能なPPTXに変換する (Phase 1 MVP).
 
 方式:
-  1. PyMuPDF でテキストを span/line/block 単位で抽出する（横書きのみ編集対象）
+  1. PyMuPDF でテキストを span/line/block 単位で抽出する（横書き・可視のみ編集対象）
   2. 編集対象テキストの領域を redaction で背景から削除する（二重写り防止。
      画像・罫線・図形は残す）
   3. redaction 後のページを画像化してスライド背景に敷く
   4. 抽出テキストを編集可能なテキストボックスとして同じ座標に重ねる
+
+Phase 1 では安全側に倒し、次のケースは編集対象にせず背景画像側に残す:
+  - 縦書き・回転テキスト（wmode / dir ベクトルで判定）
+  - ページ自体が回転している場合（/Rotate。座標補正はPhase 2以降）
+  - 不可視テキスト（alpha=0 または render mode 3。OCRの不可視テキスト層等）
+  - 文字化けテキスト（ToUnicode欠落等）
+  - 上記いずれかと bbox が重なる横書きテキスト（redactionによる欠損防止）
 
 使い方:
   python convert.py input.pdf output.pptx [--dpi 150] [--debug-dir DIR]
@@ -18,6 +25,7 @@ import argparse
 import io
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +49,12 @@ GARBLED_RATIO = 0.3
 BOX_PAD = 1.0
 # ページサイズ差をこの値 (pt) まで「同一サイズ」とみなす
 PAGE_SIZE_TOL = 1.0
+
+# --- Web公開等を見据えた基本制限（既定値。CLI/API引数で上書き可能） ---
+DEFAULT_MAX_PAGES = 200
+DEFAULT_MAX_DPI = 300
+DEFAULT_MAX_PAGE_PIXELS = 50_000_000  # 背景画像1ページあたりの画素数上限（約50MP）
+DEFAULT_MAX_FILE_SIZE_MB = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +100,14 @@ FALLBACK_LATIN_SANS = "Arial"
 FALLBACK_LATIN_SERIF = "Times New Roman"
 FALLBACK_MONO = "Courier New"
 
-# span flags (PyMuPDF)
+# span flags (PyMuPDF: フォントの見た目上のスタイル)
 FLAG_ITALIC = 1 << 1
 FLAG_MONO = 1 << 3
 FLAG_BOLD = 1 << 4
+
+# span char_flags (PyMuPDF/MuPDF: FZ_STEXT_*。描画のされ方を表す別のビット集合)
+CHAR_FLAG_FILLED = 16   # FZ_STEXT_FILLED
+CHAR_FLAG_STROKED = 32  # FZ_STEXT_STROKED
 
 _SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
 
@@ -144,6 +162,20 @@ def _is_italic(span: dict) -> bool:
     return "italic" in name or "oblique" in name
 
 
+def _is_invisible(span: dict) -> bool:
+    """描画されない(見えない)テキストか判定する。OCRの不可視テキスト層等。
+
+    - alpha == 0: 完全に透明な塗り（ウォーターマーク・隠しテキスト等）
+    - char_flags に FILLED も STROKED も立っていない: PDFのテキスト
+      描画モード3（invisible）。OCRソフトが原稿画像の上に検索用テキストを
+      重ねる際の定番の手法。
+    """
+    if span.get("alpha", 255) == 0:
+        return True
+    char_flags = span.get("char_flags", CHAR_FLAG_FILLED)
+    return not (char_flags & (CHAR_FLAG_FILLED | CHAR_FLAG_STROKED))
+
+
 # ---------------------------------------------------------------------------
 # 抽出
 # ---------------------------------------------------------------------------
@@ -170,33 +202,77 @@ def _is_garbled(text: str) -> bool:
     return text.count("�") / len(text) > GARBLED_RATIO
 
 
-def extract_editable_lines(page: pymupdf.Page) -> tuple[list[Line], list[str]]:
-    """横書きで文字化けしていない行だけを編集対象として抽出する。
+# get_text("dict") の既定フラグ (TEXTFLAGS_DICT) は画像ブロックの埋め込み
+# (TEXT_PRESERVE_IMAGES) を含む。テキストブロックしか使わないため外し、
+# 画像が多いPDFで不要なバイナリをメモリに載せないようにする。
+_DICT_FLAGS_NO_IMAGES = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 
-    縦書き (wmode=1)・回転テキスト・文字化けspanは背景画像に残す。
+
+def _get_text_dict(page: pymupdf.Page) -> dict:
+    return page.get_text("dict", flags=_DICT_FLAGS_NO_IMAGES)
+
+
+def _text_visibility(text_dict: dict) -> tuple[bool, bool]:
+    """(可視テキストが1文字でもあるか, 不可視テキストが1文字でもあるか) を返す。"""
+    any_visible = False
+    any_invisible = False
+    for block in text_dict["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                if not span["text"].strip():
+                    continue
+                if _is_invisible(span):
+                    any_invisible = True
+                else:
+                    any_visible = True
+    return any_visible, any_invisible
+
+
+def extract_editable_lines(
+    page: pymupdf.Page, text_dict: dict | None = None
+) -> tuple[list[Line], list[str]]:
+    """横書き・可視・重なりのない行だけを編集対象として抽出する。
+
+    縦書き・回転・不可視(OCR等)・文字化けのテキストは背景画像に残す。
+    それらと bbox が重なる横書き行も、redactionによる欠損を防ぐため
+    背景画像に残す（該当行ごと編集対象から除外する）。
     """
-    lines: list[Line] = []
-    warnings: list[str] = []
-    skipped_vertical = 0
-    skipped_garbled = 0
+    d = text_dict if text_dict is not None else _get_text_dict(page)
 
-    for block in page.get_text("dict")["blocks"]:
+    candidates: list[Line] = []
+    fallback_bboxes: list[pymupdf.Rect] = []
+    n_vertical = n_invisible = n_garbled = 0
+
+    for block in d["blocks"]:
         if block["type"] != 0:
             continue
         for raw_line in block["lines"]:
-            if raw_line.get("wmode", 0) != 0:
-                skipped_vertical += 1
+            is_horizontal = raw_line.get("wmode", 0) == 0
+            if is_horizontal:
+                dx, dy = raw_line["dir"]
+                is_horizontal = (
+                    dx > 1.0 - HORIZONTAL_DIR_TOL and abs(dy) < HORIZONTAL_DIR_TOL
+                )
+            if not is_horizontal:
+                for span in raw_line["spans"]:
+                    if span["text"].strip():
+                        n_vertical += 1
+                        fallback_bboxes.append(pymupdf.Rect(span["bbox"]))
                 continue
-            dx, dy = raw_line["dir"]
-            if not (dx > 1.0 - HORIZONTAL_DIR_TOL and abs(dy) < HORIZONTAL_DIR_TOL):
-                skipped_vertical += 1
-                continue
+
             spans = []
             for span in raw_line["spans"]:
                 if not span["text"].strip():
                     continue
+                if _is_invisible(span):
+                    n_invisible += 1
+                    fallback_bboxes.append(pymupdf.Rect(span["bbox"]))
+                    continue
                 if _is_garbled(span["text"]):
-                    skipped_garbled += 1
+                    n_garbled += 1
+                    fallback_bboxes.append(pymupdf.Rect(span["bbox"]))
                     continue
                 spans.append(span)
             if not spans:
@@ -204,15 +280,32 @@ def extract_editable_lines(page: pymupdf.Page) -> tuple[list[Line], list[str]]:
             bbox = pymupdf.Rect(spans[0]["bbox"])
             for span in spans[1:]:
                 bbox |= pymupdf.Rect(span["bbox"])
-            lines.append(Line(bbox=bbox, spans=spans))
+            candidates.append(Line(bbox=bbox, spans=spans))
 
-    if skipped_vertical:
+    lines: list[Line] = []
+    n_overlap = 0
+    for line in candidates:
+        if any(line.bbox.intersects(fb) for fb in fallback_bboxes):
+            n_overlap += 1
+            continue
+        lines.append(line)
+
+    warnings: list[str] = []
+    if n_vertical:
         warnings.append(
-            f"縦書き・回転テキスト {skipped_vertical} 行は編集対象外です（背景画像に残します）"
+            f"縦書き・回転テキスト {n_vertical} 行は編集対象外です（背景画像に残します）"
         )
-    if skipped_garbled:
+    if n_invisible:
         warnings.append(
-            f"文字コードを復元できないテキスト {skipped_garbled} 箇所を背景画像に残しました"
+            f"不可視のテキスト(OCR等) {n_invisible} 箇所は編集対象外です（背景画像に残します）"
+        )
+    if n_garbled:
+        warnings.append(
+            f"文字コードを復元できないテキスト {n_garbled} 箇所を背景画像に残しました"
+        )
+    if n_overlap:
+        warnings.append(
+            f"他の要素と重なる横書きテキスト {n_overlap} 行を、欠損防止のため背景画像に残しました"
         )
     return lines, warnings
 
@@ -247,19 +340,55 @@ def render_background(page: pymupdf.Page, dpi: int) -> bytes:
     return buf.getvalue()
 
 
-def process_page(page: pymupdf.Page, page_no: int, dpi: int) -> PageResult:
-    result = PageResult(width=page.rect.width, height=page.rect.height)
+def _check_pixel_budget(
+    page: pymupdf.Page, dpi: int, max_page_pixels: int, page_no: int
+) -> None:
+    """背景画像化した場合の画素数が上限を超えないか事前に検査する。"""
+    w_px = page.rect.width / 72.0 * dpi
+    h_px = page.rect.height / 72.0 * dpi
+    total = w_px * h_px
+    if total > max_page_pixels:
+        raise ValueError(
+            f"ページ{page_no + 1}: 背景画像が大きすぎます "
+            f"(約{int(w_px)}x{int(h_px)}px ≈ {total / 1e6:.1f}MP、"
+            f"上限 {max_page_pixels / 1e6:.1f}MP)。"
+            "dpiを下げるか max_page_pixels を緩めてください"
+        )
 
-    has_any_text = bool(page.get_text().strip())
-    if not has_any_text:
-        if page.get_images():
+
+def process_page(
+    page: pymupdf.Page, page_no: int, dpi: int, max_page_pixels: int
+) -> PageResult:
+    result = PageResult(width=page.rect.width, height=page.rect.height)
+    _check_pixel_budget(page, dpi, max_page_pixels, page_no)
+
+    if page.rotation != 0:
+        # ページ全体の回転は座標系の補正が絡むため、Phase 1では編集対象に
+        # せず安全側に倒す（背景画像はMuPDFが回転込みで正しく描画する）。
+        result.warnings.append(
+            f"ページの回転({page.rotation}度)を検出しました。"
+            "Phase 1では編集対象外とし、背景画像のみ出力します"
+        )
+        result.image_png = render_background(page, dpi)
+        return result
+
+    text_dict = _get_text_dict(page)
+    any_visible, any_invisible = _text_visibility(text_dict)
+
+    if not any_visible:
+        if any_invisible:
+            result.warnings.append(
+                "不可視のテキスト層を検出しました（OCR結果等の可能性）。"
+                "編集対象にはせず背景画像のみ出力します"
+            )
+        elif page.get_images():
             result.warnings.append(
                 "テキスト層がありません（スキャンPDFの可能性）。背景画像のみ出力します"
             )
         else:
             result.warnings.append("テキストがないページです。背景画像のみ出力します")
     else:
-        result.lines, warns = extract_editable_lines(page)
+        result.lines, warns = extract_editable_lines(page, text_dict=text_dict)
         result.warnings.extend(warns)
         redact_text(page, result.lines)
         # redaction漏れの自己検査: 編集対象の文字が背景に残っていれば座標系の不整合
@@ -347,15 +476,21 @@ def build_pptx(pages: list[PageResult], output: Path) -> list[str]:
     for i, pr in enumerate(pages):
         slide = prs.slides.add_slide(blank)
 
-        # ページサイズ混在: 1ページ目基準のスライドに等倍縮小・中央配置で収める
+        # ページサイズ混在: 1ページ目基準のスライドに中央配置で収める。
+        # scaleは1.0を上限とし、小さいページを勝手に拡大しない。
         if (
             abs(pr.width - slide_w) > PAGE_SIZE_TOL
             or abs(pr.height - slide_h) > PAGE_SIZE_TOL
         ):
-            scale = min(slide_w / pr.width, slide_h / pr.height)
+            scale = min(1.0, slide_w / pr.width, slide_h / pr.height)
+            action = (
+                f"{scale:.0%}に縮小して中央配置します"
+                if scale < 1.0 - 1e-9
+                else "拡大はせず中央配置します"
+            )
             warnings.append(
                 f"ページ{i + 1}: サイズが1ページ目と異なります"
-                f"（{pr.width:.0f}x{pr.height:.0f}pt）。{scale:.0%}に縮小して中央配置します"
+                f"（{pr.width:.0f}x{pr.height:.0f}pt）。{action}"
             )
         else:
             scale = 1.0
@@ -385,24 +520,65 @@ def convert(
     output_pptx: Path,
     dpi: int = 150,
     debug_dir: Path | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    max_dpi: int = DEFAULT_MAX_DPI,
+    max_page_pixels: int = DEFAULT_MAX_PAGE_PIXELS,
+    max_file_size_mb: float = DEFAULT_MAX_FILE_SIZE_MB,
+    timeout_seconds: float | None = None,
 ) -> list[str]:
-    """PDFをPPTXに変換する。戻り値は警告メッセージのリスト。"""
-    doc = pymupdf.open(input_pdf)
-    if doc.needs_pass:
-        raise ValueError(f"パスワード付きPDFは扱えません: {input_pdf}")
-    if doc.page_count == 0:
-        raise ValueError(f"ページがありません: {input_pdf}")
+    """PDFをPPTXに変換する。戻り値は警告メッセージのリスト。
+
+    制限を超えた場合は処理を始める前、または各ページ処理の開始時点で
+    ValueError / TimeoutError を送出して安全に停止する。
+    """
+    if input_pdf.resolve() == output_pptx.resolve():
+        raise ValueError(f"入力と出力に同じパスは指定できません: {input_pdf}")
+    if dpi > max_dpi:
+        raise ValueError(f"dpi={dpi} が上限 {max_dpi} を超えています")
+
+    file_size_mb = input_pdf.stat().st_size / (1024 * 1024)
+    if file_size_mb > max_file_size_mb:
+        raise ValueError(
+            f"入力PDFが大きすぎます: {file_size_mb:.1f}MB (上限 {max_file_size_mb}MB)"
+        )
 
     warnings: list[str] = []
-    pages: list[PageResult] = []
-    for i, page in enumerate(doc):
-        pr = process_page(page, i, dpi)
-        warnings.extend(f"ページ{i + 1}: {w}" for w in pr.warnings)
-        if debug_dir:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            (debug_dir / f"page{i + 1:03d}_bg.png").write_bytes(pr.image_png)
-        pages.append(pr)
-    doc.close()
+    if debug_dir and debug_dir.exists() and any(debug_dir.iterdir()):
+        warnings.append(
+            f"デバッグ出力先が既に存在し中身があります: {debug_dir}"
+            "（上書き・混在に注意してください）"
+        )
+
+    start_time = time.monotonic()
+    doc = pymupdf.open(input_pdf)
+    try:
+        if doc.needs_pass:
+            raise ValueError(f"パスワード付きPDFは扱えません: {input_pdf}")
+        if doc.page_count == 0:
+            raise ValueError(f"ページがありません: {input_pdf}")
+        if doc.page_count > max_pages:
+            raise ValueError(
+                f"ページ数が上限を超えています: {doc.page_count} (上限 {max_pages})"
+            )
+
+        pages: list[PageResult] = []
+        for i, page in enumerate(doc):
+            if (
+                timeout_seconds is not None
+                and time.monotonic() - start_time > timeout_seconds
+            ):
+                raise TimeoutError(
+                    f"処理時間が上限({timeout_seconds}秒)を超えました"
+                    f"（{i}/{doc.page_count} ページ処理済み）"
+                )
+            pr = process_page(page, i, dpi, max_page_pixels)
+            warnings.extend(f"ページ{i + 1}: {w}" for w in pr.warnings)
+            if debug_dir:
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                (debug_dir / f"page{i + 1:03d}_bg.png").write_bytes(pr.image_png)
+            pages.append(pr)
+    finally:
+        doc.close()
 
     warnings.extend(build_pptx(pages, output_pptx))
     return warnings
@@ -417,7 +593,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dpi", type=int, default=150, help="背景画像の解像度 (既定: 150)")
     parser.add_argument(
         "--debug-dir", type=Path, default=None,
-        help="redaction後の背景PNGを保存するディレクトリ（検証用）",
+        help="redaction後の背景PNGを保存するディレクトリ（検証用。機密PDFでは使わないこと）",
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=DEFAULT_MAX_PAGES,
+        help=f"ページ数の上限 (既定: {DEFAULT_MAX_PAGES})",
+    )
+    parser.add_argument(
+        "--max-dpi", type=int, default=DEFAULT_MAX_DPI,
+        help=f"dpiの上限 (既定: {DEFAULT_MAX_DPI})",
+    )
+    parser.add_argument(
+        "--max-page-pixels", type=int, default=DEFAULT_MAX_PAGE_PIXELS,
+        help=f"背景画像1ページあたりの画素数上限 (既定: {DEFAULT_MAX_PAGE_PIXELS})",
+    )
+    parser.add_argument(
+        "--max-file-size-mb", type=float, default=DEFAULT_MAX_FILE_SIZE_MB,
+        help=f"入力PDFのファイルサイズ上限MB (既定: {DEFAULT_MAX_FILE_SIZE_MB})",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=None,
+        help="処理時間の上限（秒）。既定は無制限",
     )
     args = parser.parse_args(argv)
 
@@ -426,7 +622,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        warnings = convert(args.input, args.output, dpi=args.dpi, debug_dir=args.debug_dir)
+        warnings = convert(
+            args.input, args.output, dpi=args.dpi, debug_dir=args.debug_dir,
+            max_pages=args.max_pages, max_dpi=args.max_dpi,
+            max_page_pixels=args.max_page_pixels,
+            max_file_size_mb=args.max_file_size_mb,
+            timeout_seconds=args.timeout,
+        )
     except Exception as e:  # noqa: BLE001 - CLIの最上位でまとめて報告する
         print(f"エラー: {e}", file=sys.stderr)
         return 1
