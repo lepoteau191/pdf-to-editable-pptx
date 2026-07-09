@@ -1,27 +1,30 @@
-# プロジェクト名
+# pdf2pptx
 
-> 新規プロジェクトの雛形です。`_template/` をコピーしてプロジェクト名にリネームして使ってください。
->
-> ```bash
-> cp -r _template my-new-project
-> ```
+PDFを編集可能なPPTXに変換するCLIツール（自社ツール・Phase 1 MVP）。
 
 ## 概要
 
-（このプロジェクトが何をするものか、1〜2行で）
+PyMuPDFのredaction機能でPDFページの背景画像からテキストを削除し（編集可能テキストとの二重写りを防止）、
+その上にPowerPointの編集可能なテキストボックスを重ねて配置する方式でPDF→PPTX変換を行う。
+
+Phase 1の範囲:
+
+- 編集対象は横書きテキストのみ。縦書き・回転テキストは背景画像側に残す（編集不可）。
+- スキャンPDF（テキストレイヤーなしの画像PDF）は検出し、背景画像のみを配置した上で警告を出す。
 
 ## セットアップ
 
 ```bash
-# 例（Python の場合）
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install pymupdf python-pptx pillow
 ```
 
 ## 使い方
 
-（起動コマンドや主要な操作）
+```bash
+python convert.py input.pdf output.pptx
+```
 
 ## ディレクトリ構成
 
