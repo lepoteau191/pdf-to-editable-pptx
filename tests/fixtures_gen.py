@@ -1,0 +1,130 @@
+"""テスト用の合成PDFを生成する（ネットワーク不使用・完全ローカル）。"""
+
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import pymupdf
+from PIL import Image
+
+A4_W, A4_H = 595.0, 842.0
+
+TITLE = "2026年度 事業計画書"
+CONFIDENTIAL = "Confidential - Internal Use Only"
+BODY_LINES = [
+    "本資料は事業計画の概要をまとめたものです。",
+    "対象期間は2026年4月から2027年3月までとします。",
+    "数値はすべて概算であり、確定値ではありません。",
+]
+NOTE = "※ 社外秘。取り扱いに注意してください。"
+FOOTER = "pdf2pptx test fixture - page 1"
+TABLE_HEADER = ["項目", "上期", "下期", "合計"]
+TABLE_ROWS = [
+    ["売上高", "1,234", "1,567", "2,801"],
+    ["営業利益", "234", "312", "546"],
+]
+ROTATED_TEXT = "回転テキストは編集対象外"
+PAGE2_BODY = "2ページ目の通常テキストです。"
+ROTATED_PAGE_TEXT = "回転ページのテキスト"
+MIXED_P1_TEXT = "縦ページのテキスト"
+MIXED_P2_TEXT = "横ページのテキスト"
+
+TITLE_COLOR = (0x1F / 255, 0x38 / 255, 0x64 / 255)  # 0x1F3864
+RED = (0.8, 0.1, 0.1)
+GRAY = (0.45, 0.45, 0.45)
+
+# PyMuPDFのpip wheelにはCJK内蔵フォントがないため、macOSのシステムフォントを使う
+JP_FONT_FILE = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+
+
+def _jp_text(page, point, text, size, color=(0, 0, 0), rotate=0):
+    page.insert_text(point, text, fontname="jpfx", fontfile=JP_FONT_FILE,
+                     fontsize=size, color=color, rotate=rotate)
+
+
+def _logo_png() -> bytes:
+    """Pillowで簡単なロゴ風画像を作る。"""
+    img = Image.new("RGB", (240, 120))
+    px = img.load()
+    for y in range(120):
+        for x in range(240):
+            px[x, y] = (30 + x // 2, 80 + y, 160)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _draw_table(page: pymupdf.Page, x: float, y: float) -> None:
+    col_w, row_h = 100.0, 24.0
+    n_cols = len(TABLE_HEADER)
+    n_rows = 1 + len(TABLE_ROWS)
+    # ヘッダ行の塗り
+    page.draw_rect(
+        pymupdf.Rect(x, y, x + col_w * n_cols, y + row_h),
+        fill=(0.90, 0.92, 0.96), color=None,
+    )
+    # 罫線
+    for i in range(n_rows + 1):
+        page.draw_line((x, y + i * row_h), (x + col_w * n_cols, y + i * row_h),
+                       color=GRAY, width=0.7)
+    for j in range(n_cols + 1):
+        page.draw_line((x + j * col_w, y), (x + j * col_w, y + n_rows * row_h),
+                       color=GRAY, width=0.7)
+    # セルの文字
+    rows = [TABLE_HEADER] + TABLE_ROWS
+    for r, row in enumerate(rows):
+        for c, text in enumerate(row):
+            _jp_text(page, (x + c * col_w + 6, y + r * row_h + row_h - 8),
+                     text, 10)
+
+
+def make_business_pdf(path: Path) -> None:
+    """3ページ構成: ビジネス文書 / 回転テキスト入り / スキャン風（画像のみ）。"""
+    doc = pymupdf.open()
+
+    # --- page 1: 横書きビジネス文書（表・画像・色・太字入り） ---
+    page = doc.new_page(width=A4_W, height=A4_H)
+    _jp_text(page, (60, 80), TITLE, 20, color=TITLE_COLOR)
+    page.insert_text((60, 110), CONFIDENTIAL, fontname="hebo",  # Helvetica-Bold
+                     fontsize=11, color=RED)
+    for i, line in enumerate(BODY_LINES):
+        _jp_text(page, (60, 160 + i * 18), line, 10.5)
+    _jp_text(page, (60, 230), NOTE, 9, color=RED)
+    page.insert_image(pymupdf.Rect(420, 50, 540, 110), stream=_logo_png())
+    _draw_table(page, 60, 280)
+    page.insert_text((60, 810), FOOTER, fontname="helv", fontsize=8, color=GRAY)
+
+    # --- page 2: 通常テキスト + 回転テキスト ---
+    page2 = doc.new_page(width=A4_W, height=A4_H)
+    _jp_text(page2, (60, 80), PAGE2_BODY, 12)
+    _jp_text(page2, (100, 500), ROTATED_TEXT, 12, rotate=90)
+
+    # --- page 3: スキャン風（page1のレンダリング画像のみ・テキスト層なし） ---
+    pix = doc[0].get_pixmap(dpi=100)
+    page3 = doc.new_page(width=A4_W, height=A4_H)
+    page3.insert_image(page3.rect, pixmap=pix)
+
+    doc.save(path)
+    doc.close()
+
+
+def make_mixed_pdf(path: Path) -> None:
+    """ページサイズ混在: A4縦 + A4横。"""
+    doc = pymupdf.open()
+    p1 = doc.new_page(width=A4_W, height=A4_H)
+    _jp_text(p1, (60, 80), MIXED_P1_TEXT, 12)
+    p2 = doc.new_page(width=A4_H, height=A4_W)
+    _jp_text(p2, (60, 80), MIXED_P2_TEXT, 12)
+    doc.save(path)
+    doc.close()
+
+
+def make_rotated_page_pdf(path: Path) -> None:
+    """ページ自体に /Rotate 90 が付いたPDF（座標系の整合性検査用）。"""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_W, height=A4_H)
+    _jp_text(page, (60, 80), ROTATED_PAGE_TEXT, 12)
+    page.set_rotation(90)
+    doc.save(path)
+    doc.close()

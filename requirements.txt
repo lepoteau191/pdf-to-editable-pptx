@@ -1,0 +1,4 @@
+pymupdf>=1.26
+python-pptx>=1.0
+pillow>=10
+pytest>=8

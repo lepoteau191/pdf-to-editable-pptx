@@ -1,19 +1,21 @@
-# <project-name>
+# pdf2pptx
 
-<このプロジェクトが何か・誰のためかを1〜2行で>
+PDFを編集可能なPPTXに変換するCLIツール（自社ツール・Phase 1 MVP）。
+PyMuPDFのredactionでテキストを消した背景画像を敷き、その上に編集可能テキストボックスを重ねる方式。
 
 ## コマンド
 
-- 起動: `<command>`
-- テスト: `<command>`
+- 環境構築: `uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt`
+- 実行: `.venv/bin/python convert.py input.pdf output.pptx [--dpi 150] [--debug-dir DIR]`
+- テスト: `.venv/bin/python -m pytest -q`
 
 ## 構成
 
-- `src/` … <主要モジュール>
-- `tests/` … <テスト方針（合成データ・ネットワーク不使用など）>
+- `convert.py` … 変換本体（抽出 → redaction → 背景画像化 → PPTX組み立て）
+- `tests/` … pytest。フィクスチャは `tests/fixtures_gen.py` が生成する合成PDFのみ（ネットワーク不使用）
 
 ## 守ること
 
-- <このプロジェクト固有の制約。常時必要なものだけをここに書く>
-- <制約が5行を超えるなら `.claude/rules/<project>.md`（paths スコープ付き）に移して参照する>
-- コード変更後はテストを通す。生成物・秘密情報はコミットしない。
+- テストは合成PDFのみ。実PDF（顧客資料等）や生成物（*.pptx）をコミットしない。
+- コード変更後は `.venv/bin/python -m pytest -q` を通す。
+- Phase 1 の範囲: 横書きのみ編集対象。縦書き・回転テキスト・文字化けspanは背景に残す。スキャンPDFは背景のみ+警告。

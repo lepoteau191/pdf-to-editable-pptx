@@ -2,34 +2,66 @@
 
 PDFを編集可能なPPTXに変換するCLIツール（自社ツール・Phase 1 MVP）。
 
-## 概要
+## 方式
 
-PyMuPDFのredaction機能でPDFページの背景画像からテキストを削除し（編集可能テキストとの二重写りを防止）、
-その上にPowerPointの編集可能なテキストボックスを重ねて配置する方式でPDF→PPTX変換を行う。
+1. PyMuPDFでテキストを span / line 単位で抽出する（座標・フォントサイズ・色・太字/斜体）
+2. 編集対象テキストの領域を **redaction で背景から削除**する（編集テキストとの二重写りを防止。
+   画像・罫線・図形・表の枠は残る）
+3. redaction後のページを画像化（既定150dpi）してスライド背景いっぱいに敷く
+4. 抽出テキストを同じ座標に**編集可能なテキストボックス**として重ねる
+   （PDF pt → PPTX EMU 変換。スライドサイズ＝PDFページサイズ。内部マージン0・折り返しなし）
 
-Phase 1の範囲:
+Phase 1 の範囲:
 
-- 編集対象は横書きテキストのみ。縦書き・回転テキストは背景画像側に残す（編集不可）。
-- スキャンPDF（テキストレイヤーなしの画像PDF）は検出し、背景画像のみを配置した上で警告を出す。
+- 編集対象は**横書きテキストのみ**。縦書き・回転テキストは背景画像側に残す（表示は保たれるが編集不可）。
+- 文字コードを復元できないテキスト（ToUnicode欠落）は背景に残す。
+- スキャンPDF（テキスト層なし）は検出し、背景画像のみのスライド+警告を出す。
+- ページサイズ混在PDFは警告を出し、1ページ目基準のスライドに等倍縮小・中央配置で収める。
+- フォントは簡易マッピング（ＭＳ ゴシック等の対応表 + 和文/欧文・セリフ判定によるフォールバック）。
+  日本語には `a:ea`（東アジアフォント）も設定する。
 
 ## セットアップ
 
+Python 3.10 以上が必要（このマシンでは uv を使う）:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install pymupdf python-pptx pillow
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 ## 使い方
 
 ```bash
-python convert.py input.pdf output.pptx
+.venv/bin/python convert.py input.pdf output.pptx
 ```
+
+オプション:
+
+- `--dpi N` … 背景画像の解像度（既定: 150）
+- `--debug-dir DIR` … redaction後の背景PNGを保存（二重写り検証用）
+
+縦書き・スキャンページ等の警告は標準エラーに出力される。
+
+## テスト
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+フィクスチャは `tests/fixtures_gen.py` が生成する合成PDFのみ（ネットワーク不使用）。
+表・画像・色・太字・回転テキスト・スキャン風ページ・ページサイズ混在・/Rotate付きページを網羅する。
 
 ## ディレクトリ構成
 
 | パス | 内容 |
 |------|------|
-| `src/`  | ソースコード |
-| `tests/`| テスト |
-| `docs/` | ドキュメント |
+| `convert.py` | 変換本体（CLI） |
+| `tests/`     | pytest + フィクスチャ生成 |
+| `docs/`      | ドキュメント |
+
+## Phase 2 以降の候補
+
+- 縦書き（`<a:bodyPr vert="eaVert">`）・回転テキストの編集対応
+- `page.find_tables()` によるネイティブPPTX表への変換
+- ローカルOCRによるスキャンPDF対応
+- ベースライン基準の精密位置合わせ・フォント対応表の拡充
