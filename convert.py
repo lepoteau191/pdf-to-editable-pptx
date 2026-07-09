@@ -620,6 +620,22 @@ def _looks_like_pdf(path: Path) -> bool:
     return b"%PDF-" in head
 
 
+def check_distinct_input_output(input_pdf: Path, output_pptx: Path) -> None:
+    """入力と出力が同一ファイルでないことを検査する（パス一致・ハードリンク双方）。
+
+    worker.py は convert.py を別プロセスで起動する際、実際の出力先ではなく
+    一時ディレクトリ内のパスを子プロセスに渡すため、この関数内での検査だけでは
+    worker.py 経由の実行を保護できない。worker.py 側でも、子プロセスに渡す前の
+    「本来の入出力パス」に対して本関数を呼び出す必要がある。
+    """
+    if input_pdf.resolve() == output_pptx.resolve():
+        raise ValueError(f"入力と出力に同じパスは指定できません: {input_pdf}")
+    if output_pptx.exists() and os.path.samefile(input_pdf, output_pptx):
+        raise ValueError(
+            f"入力と出力が同一ファイルです（ハードリンク等の可能性）: {input_pdf}"
+        )
+
+
 def convert(
     input_pdf: Path,
     output_pptx: Path,
@@ -642,12 +658,7 @@ def convert(
     ハードタイムアウト(SIGKILL)を使うこと。
     """
     # --- パス・パラメータの検証（重い処理の前に済ませる） ---
-    if input_pdf.resolve() == output_pptx.resolve():
-        raise ValueError(f"入力と出力に同じパスは指定できません: {input_pdf}")
-    if output_pptx.exists() and os.path.samefile(input_pdf, output_pptx):
-        raise ValueError(
-            f"入力と出力が同一ファイルです（ハードリンク等の可能性）: {input_pdf}"
-        )
+    check_distinct_input_output(input_pdf, output_pptx)
 
     _check_positive("dpi", dpi)
     _check_positive("max_pages", max_pages)
