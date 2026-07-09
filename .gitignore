@@ -1,0 +1,32 @@
+# --- 機密情報（最重要） ---
+.env
+.env.*
+*.key
+*.pem
+secrets/
+credentials*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Node ---
+node_modules/
+dist/
+build/
+
+# --- テスト / キャッシュ ---
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# --- データ ---
+data/
+
+# --- OS / エディタ ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
