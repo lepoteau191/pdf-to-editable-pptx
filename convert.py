@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pdf2pptx — PDFを編集可能なPPTXに変換する (Phase 1 MVP).
+"""pdf2pptx — PDFを編集可能なPPTXに変換する (Phase 1.1).
 
 方式:
   1. PyMuPDF でテキストを span/line/block 単位で抽出する（横書き・可視のみ編集対象）
@@ -14,6 +14,14 @@ Phase 1 では安全側に倒し、次のケースは編集対象にせず背景
   - 不可視テキスト（alpha=0 または render mode 3。OCRの不可視テキスト層等）
   - 文字化けテキスト（ToUnicode欠落等）
   - 上記いずれかと bbox が重なる横書きテキスト（redactionによる欠損防止）
+  - ページ面積の大部分（既定85%以上）が画像で覆われている場合、そのページの
+    可視テキストも含めて編集対象にしない（画像に焼き込まれた文字を編集可能
+    テキスト化すると、画像と重なって二重写りになるリスクがあるため）
+
+Web公開等を見据え、ページ数・dpi・画素数（1ページ/全ページ合計）・入出力ファイル
+サイズ・処理時間に上限を設けている。超過時は変換前、または各ページ処理開始時点で
+安全に停止する（ソフトタイムアウト）。プロセスが応答しなくなった場合に確実に
+強制終了したい場合は worker.py（別プロセス+ハードタイムアウト）を使うこと。
 
 使い方:
   python convert.py input.pdf output.pptx [--dpi 150] [--debug-dir DIR]
@@ -23,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import re
 import sys
 import time
@@ -38,6 +47,7 @@ from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
 
 EMU_PER_PT = 12700
+PT_PER_INCH = 72.0
 
 # 横書き判定: line の書字方向ベクトルが (1, 0) にほぼ一致すること
 HORIZONTAL_DIR_TOL = 0.02
@@ -49,12 +59,20 @@ GARBLED_RATIO = 0.3
 BOX_PAD = 1.0
 # ページサイズ差をこの値 (pt) まで「同一サイズ」とみなす
 PAGE_SIZE_TOL = 1.0
+# ページ面積のこの割合以上を画像が覆っていたら「全面画像ページ」とみなし、
+# 可視テキストがあっても編集対象にしない（二重写りリスクの回避）
+FULL_IMAGE_COVERAGE_THRESHOLD = 0.85
+# PowerPoint (OOXML) のスライドサイズ制限
+PPTX_MIN_SLIDE_INCH = 1.0
+PPTX_MAX_SLIDE_INCH = 56.0
 
 # --- Web公開等を見据えた基本制限（既定値。CLI/API引数で上書き可能） ---
 DEFAULT_MAX_PAGES = 200
 DEFAULT_MAX_DPI = 300
-DEFAULT_MAX_PAGE_PIXELS = 50_000_000  # 背景画像1ページあたりの画素数上限（約50MP）
+DEFAULT_MAX_PAGE_PIXELS = 50_000_000     # 背景画像1ページあたりの画素数上限（約50MP）
+DEFAULT_MAX_TOTAL_PIXELS = 500_000_000   # 背景画像の全ページ合計の画素数上限（約500MP）
 DEFAULT_MAX_FILE_SIZE_MB = 100.0
+DEFAULT_MAX_OUTPUT_SIZE_MB = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +248,30 @@ def _text_visibility(text_dict: dict) -> tuple[bool, bool]:
     return any_visible, any_invisible
 
 
+def _image_coverage_ratio(page: pymupdf.Page) -> float:
+    """ページ面積に対する画像の被覆率を概算する(0.0〜1.0)。
+
+    厳密な和集合面積は計算せず、「最大の1枚の画像の面積」と「全画像面積の
+    単純合計（重なりを考慮しない概算）」の大きい方を採用する。全面スキャン画像
+    (1枚が全面を覆う)・タイル状に分割された全面画像のどちらでも検出できる、
+    安全側に倒した近似。
+    """
+    page_area = page.rect.width * page.rect.height
+    if page_area <= 0:
+        return 0.0
+    infos = page.get_image_info()
+    if not infos:
+        return 0.0
+    largest = 0.0
+    total = 0.0
+    for info in infos:
+        r = pymupdf.Rect(info["bbox"]) & page.rect
+        area = max(r.width, 0.0) * max(r.height, 0.0)
+        largest = max(largest, area)
+        total += area
+    return min(max(largest, total) / page_area, 1.0)
+
+
 def extract_editable_lines(
     page: pymupdf.Page, text_dict: dict | None = None
 ) -> tuple[list[Line], list[str]]:
@@ -340,19 +382,58 @@ def render_background(page: pymupdf.Page, dpi: int) -> bytes:
     return buf.getvalue()
 
 
+def _page_pixel_count(page: pymupdf.Page, dpi: int) -> float:
+    """指定dpiで背景画像化した場合の概算画素数。"""
+    w_px = page.rect.width / 72.0 * dpi
+    h_px = page.rect.height / 72.0 * dpi
+    return w_px * h_px
+
+
 def _check_pixel_budget(
     page: pymupdf.Page, dpi: int, max_page_pixels: int, page_no: int
 ) -> None:
-    """背景画像化した場合の画素数が上限を超えないか事前に検査する。"""
-    w_px = page.rect.width / 72.0 * dpi
-    h_px = page.rect.height / 72.0 * dpi
-    total = w_px * h_px
+    """背景画像化した場合の画素数が1ページあたりの上限を超えないか検査する。"""
+    total = _page_pixel_count(page, dpi)
     if total > max_page_pixels:
         raise ValueError(
             f"ページ{page_no + 1}: 背景画像が大きすぎます "
-            f"(約{int(w_px)}x{int(h_px)}px ≈ {total / 1e6:.1f}MP、"
-            f"上限 {max_page_pixels / 1e6:.1f}MP)。"
+            f"(約{total / 1e6:.1f}MP、上限 {max_page_pixels / 1e6:.1f}MP)。"
             "dpiを下げるか max_page_pixels を緩めてください"
+        )
+
+
+def _check_total_pixel_budget(
+    doc: pymupdf.Document, dpi: int, max_total_pixels: float
+) -> None:
+    """全ページ合計の画素数が上限を超えないか、変換開始前に検査する。"""
+    total = sum(_page_pixel_count(p, dpi) for p in doc)
+    if total > max_total_pixels:
+        raise ValueError(
+            f"全ページ合計の背景画像が大きすぎます "
+            f"(約{total / 1e6:.1f}MP、上限 {max_total_pixels / 1e6:.1f}MP)。"
+            "dpiを下げるか、ページ数・max_total_pixelsを見直してください"
+        )
+
+
+def _check_slide_size_limits(width_pt: float, height_pt: float) -> None:
+    """1ページ目のサイズが PowerPoint のスライドサイズ制限内かを検査する。
+
+    スライドサイズは1ページ目のサイズで決まるため、これを満たしていれば
+    デッキ全体としてPowerPointで開ける寸法になる。
+    """
+    w_in = width_pt / PT_PER_INCH
+    h_in = height_pt / PT_PER_INCH
+    if not (PPTX_MIN_SLIDE_INCH <= w_in <= PPTX_MAX_SLIDE_INCH):
+        raise ValueError(
+            f"PDFページの幅がPowerPointのスライドサイズ制限"
+            f"({PPTX_MIN_SLIDE_INCH:.0f}〜{PPTX_MAX_SLIDE_INCH:.0f}インチ)"
+            f"を超えています: {w_in:.2f}インチ"
+        )
+    if not (PPTX_MIN_SLIDE_INCH <= h_in <= PPTX_MAX_SLIDE_INCH):
+        raise ValueError(
+            f"PDFページの高さがPowerPointのスライドサイズ制限"
+            f"({PPTX_MIN_SLIDE_INCH:.0f}〜{PPTX_MAX_SLIDE_INCH:.0f}インチ)"
+            f"を超えています: {h_in:.2f}インチ"
         )
 
 
@@ -374,6 +455,8 @@ def process_page(
 
     text_dict = _get_text_dict(page)
     any_visible, any_invisible = _text_visibility(text_dict)
+    image_coverage = _image_coverage_ratio(page)
+    full_page_image = image_coverage >= FULL_IMAGE_COVERAGE_THRESHOLD
 
     if not any_visible:
         if any_invisible:
@@ -387,6 +470,15 @@ def process_page(
             )
         else:
             result.warnings.append("テキストがないページです。背景画像のみ出力します")
+    elif full_page_image:
+        # 可視テキストはあるが、ページの大部分が画像で覆われている。
+        # 画像に焼き込まれた文字を編集可能テキスト化すると、画像と重なって
+        # 二重写りになるリスクがあるため、このページ全体を背景画像のみにする。
+        result.warnings.append(
+            f"ページ面積の約{image_coverage:.0%}が画像で覆われています。"
+            "画像上の文字が二重写りになるリスクがあるため、"
+            "編集対象にはせず背景画像のみ出力します"
+        )
     else:
         result.lines, warns = extract_editable_lines(page, text_dict=text_dict)
         result.warnings.extend(warns)
@@ -463,57 +555,70 @@ def _add_line_textbox(slide, line: Line, scale: float, dx: float, dy: float) -> 
         _set_run_font(run, map_font(span.get("font", ""), span["text"]))
 
 
-def build_pptx(pages: list[PageResult], output: Path) -> list[str]:
-    """ページ処理結果からPPTXを組み立てる。戻り値は警告リスト。"""
+def _add_page_slide(
+    prs: Presentation, blank_layout, pr: PageResult, slide_w: float, slide_h: float,
+    page_index: int,
+) -> list[str]:
+    """1ページ分のスライド(背景画像+編集可能テキスト)を追加する。戻り値は警告。"""
     warnings: list[str] = []
-    slide_w, slide_h = pages[0].width, pages[0].height
+    slide = prs.slides.add_slide(blank_layout)
 
-    prs = Presentation()
-    prs.slide_width = Emu(_pt_to_emu(slide_w))
-    prs.slide_height = Emu(_pt_to_emu(slide_h))
-    blank = prs.slide_layouts[6]
-
-    for i, pr in enumerate(pages):
-        slide = prs.slides.add_slide(blank)
-
-        # ページサイズ混在: 1ページ目基準のスライドに中央配置で収める。
-        # scaleは1.0を上限とし、小さいページを勝手に拡大しない。
-        if (
-            abs(pr.width - slide_w) > PAGE_SIZE_TOL
-            or abs(pr.height - slide_h) > PAGE_SIZE_TOL
-        ):
-            scale = min(1.0, slide_w / pr.width, slide_h / pr.height)
-            action = (
-                f"{scale:.0%}に縮小して中央配置します"
-                if scale < 1.0 - 1e-9
-                else "拡大はせず中央配置します"
-            )
-            warnings.append(
-                f"ページ{i + 1}: サイズが1ページ目と異なります"
-                f"（{pr.width:.0f}x{pr.height:.0f}pt）。{action}"
-            )
-        else:
-            scale = 1.0
-        dx = (slide_w - pr.width * scale) / 2
-        dy = (slide_h - pr.height * scale) / 2
-
-        slide.shapes.add_picture(
-            io.BytesIO(pr.image_png),
-            _pt_to_emu(dx),
-            _pt_to_emu(dy),
-            width=_pt_to_emu(pr.width * scale),
-            height=_pt_to_emu(pr.height * scale),
+    # ページサイズ混在: 1ページ目基準のスライドに中央配置で収める。
+    # scaleは1.0を上限とし、小さいページを勝手に拡大しない。
+    if (
+        abs(pr.width - slide_w) > PAGE_SIZE_TOL
+        or abs(pr.height - slide_h) > PAGE_SIZE_TOL
+    ):
+        scale = min(1.0, slide_w / pr.width, slide_h / pr.height)
+        action = (
+            f"{scale:.0%}に縮小して中央配置します"
+            if scale < 1.0 - 1e-9
+            else "拡大はせず中央配置します"
         )
-        for line in pr.lines:
-            _add_line_textbox(slide, line, scale, dx, dy)
+        warnings.append(
+            f"ページ{page_index + 1}: サイズが1ページ目と異なります"
+            f"（{pr.width:.0f}x{pr.height:.0f}pt）。{action}"
+        )
+    else:
+        scale = 1.0
+    dx = (slide_w - pr.width * scale) / 2
+    dy = (slide_h - pr.height * scale) / 2
 
-    prs.save(output)
+    slide.shapes.add_picture(
+        io.BytesIO(pr.image_png),
+        _pt_to_emu(dx),
+        _pt_to_emu(dy),
+        width=_pt_to_emu(pr.width * scale),
+        height=_pt_to_emu(pr.height * scale),
+    )
+    for line in pr.lines:
+        _add_line_textbox(slide, line, scale, dx, dy)
+
     return warnings
 
 
 # ---------------------------------------------------------------------------
 # 変換パイプライン / CLI
 # ---------------------------------------------------------------------------
+
+def _check_positive(name: str, value: float) -> None:
+    if value <= 0:
+        raise ValueError(f"{name} は正の値である必要があります: {value}")
+
+
+def _looks_like_pdf(path: Path) -> bool:
+    """先頭付近に %PDF- マジックバイトがあるかを確認する（簡易な入力検証）。
+
+    PDF仕様上、ヘッダの前に最大1024バイト程度のゴミが許容されるため、
+    先頭1024バイトの範囲で探す。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return False
+    return b"%PDF-" in head
+
 
 def convert(
     input_pdf: Path,
@@ -523,16 +628,37 @@ def convert(
     max_pages: int = DEFAULT_MAX_PAGES,
     max_dpi: int = DEFAULT_MAX_DPI,
     max_page_pixels: int = DEFAULT_MAX_PAGE_PIXELS,
+    max_total_pixels: float = DEFAULT_MAX_TOTAL_PIXELS,
     max_file_size_mb: float = DEFAULT_MAX_FILE_SIZE_MB,
+    max_output_size_mb: float = DEFAULT_MAX_OUTPUT_SIZE_MB,
     timeout_seconds: float | None = None,
 ) -> list[str]:
     """PDFをPPTXに変換する。戻り値は警告メッセージのリスト。
 
     制限を超えた場合は処理を始める前、または各ページ処理の開始時点で
     ValueError / TimeoutError を送出して安全に停止する。
+    これはプロセス内のソフトタイムアウトであり、ネイティブコード内で
+    ハングした場合等に確実に止めたい場合は worker.py の別プロセス+
+    ハードタイムアウト(SIGKILL)を使うこと。
     """
+    # --- パス・パラメータの検証（重い処理の前に済ませる） ---
     if input_pdf.resolve() == output_pptx.resolve():
         raise ValueError(f"入力と出力に同じパスは指定できません: {input_pdf}")
+    if output_pptx.exists() and os.path.samefile(input_pdf, output_pptx):
+        raise ValueError(
+            f"入力と出力が同一ファイルです（ハードリンク等の可能性）: {input_pdf}"
+        )
+
+    _check_positive("dpi", dpi)
+    _check_positive("max_pages", max_pages)
+    _check_positive("max_dpi", max_dpi)
+    _check_positive("max_page_pixels", max_page_pixels)
+    _check_positive("max_total_pixels", max_total_pixels)
+    _check_positive("max_file_size_mb", max_file_size_mb)
+    _check_positive("max_output_size_mb", max_output_size_mb)
+    if timeout_seconds is not None and timeout_seconds < 0:
+        raise ValueError(f"timeout_seconds は0以上である必要があります: {timeout_seconds}")
+
     if dpi > max_dpi:
         raise ValueError(f"dpi={dpi} が上限 {max_dpi} を超えています")
 
@@ -542,16 +668,23 @@ def convert(
             f"入力PDFが大きすぎます: {file_size_mb:.1f}MB (上限 {max_file_size_mb}MB)"
         )
 
-    warnings: list[str] = []
-    if debug_dir and debug_dir.exists() and any(debug_dir.iterdir()):
-        warnings.append(
-            f"デバッグ出力先が既に存在し中身があります: {debug_dir}"
-            "（上書き・混在に注意してください）"
+    if not _looks_like_pdf(input_pdf):
+        raise ValueError(
+            f"入力ファイルがPDFではないようです（%PDFヘッダが見つかりません）: {input_pdf}"
         )
 
+    if debug_dir is not None and debug_dir.exists() and any(debug_dir.iterdir()):
+        raise ValueError(
+            f"デバッグ出力先が空ではありません: {debug_dir}"
+            "（既存ファイルの上書き事故を防ぐため、空のディレクトリのみ指定できます）"
+        )
+
+    warnings: list[str] = []
     start_time = time.monotonic()
     doc = pymupdf.open(input_pdf)
     try:
+        if not doc.is_pdf:
+            raise ValueError(f"PDFとして認識できませんでした: {input_pdf}")
         if doc.needs_pass:
             raise ValueError(f"パスワード付きPDFは扱えません: {input_pdf}")
         if doc.page_count == 0:
@@ -561,7 +694,20 @@ def convert(
                 f"ページ数が上限を超えています: {doc.page_count} (上限 {max_pages})"
             )
 
-        pages: list[PageResult] = []
+        # 全ページ合計の画素数を、実際に描画する前に検査する。
+        _check_total_pixel_budget(doc, dpi, max_total_pixels)
+
+        first_rect = doc[0].rect
+        _check_slide_size_limits(first_rect.width, first_rect.height)
+        slide_w, slide_h = first_rect.width, first_rect.height
+
+        prs = Presentation()
+        prs.slide_width = Emu(_pt_to_emu(slide_w))
+        prs.slide_height = Emu(_pt_to_emu(slide_h))
+        blank_layout = prs.slide_layouts[6]
+
+        # 各ページの背景画像を溜め込まず、都度スライドに追加してから破棄する
+        # （全ページ分をメモリに保持するピーク使用量を抑えるため）。
         for i, page in enumerate(doc):
             if (
                 timeout_seconds is not None
@@ -576,24 +722,34 @@ def convert(
             if debug_dir:
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 (debug_dir / f"page{i + 1:03d}_bg.png").write_bytes(pr.image_png)
-            pages.append(pr)
+            warnings.extend(_add_page_slide(prs, blank_layout, pr, slide_w, slide_h, i))
     finally:
         doc.close()
 
-    warnings.extend(build_pptx(pages, output_pptx))
+    prs.save(output_pptx)
+
+    output_size_mb = output_pptx.stat().st_size / (1024 * 1024)
+    if output_size_mb > max_output_size_mb:
+        output_pptx.unlink(missing_ok=True)
+        raise ValueError(
+            f"出力PPTXが大きすぎます: {output_size_mb:.1f}MB (上限 {max_output_size_mb}MB)"
+        )
+
     return warnings
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """CLI引数パーサ。worker.py からも共有して二重メンテを避ける。"""
     parser = argparse.ArgumentParser(
-        description="PDFを編集可能なPPTXに変換する (Phase 1 MVP)"
+        description="PDFを編集可能なPPTXに変換する (Phase 1.1)"
     )
     parser.add_argument("input", type=Path, help="入力PDF")
     parser.add_argument("output", type=Path, help="出力PPTX")
     parser.add_argument("--dpi", type=int, default=150, help="背景画像の解像度 (既定: 150)")
     parser.add_argument(
         "--debug-dir", type=Path, default=None,
-        help="redaction後の背景PNGを保存するディレクトリ（検証用。機密PDFでは使わないこと）",
+        help="redaction後の背景PNGを保存する空のディレクトリ（検証用。"
+             "機密PDFや本番では使わないこと）",
     )
     parser.add_argument(
         "--max-pages", type=int, default=DEFAULT_MAX_PAGES,
@@ -608,13 +764,26 @@ def main(argv: list[str] | None = None) -> int:
         help=f"背景画像1ページあたりの画素数上限 (既定: {DEFAULT_MAX_PAGE_PIXELS})",
     )
     parser.add_argument(
+        "--max-total-pixels", type=float, default=DEFAULT_MAX_TOTAL_PIXELS,
+        help=f"背景画像の全ページ合計の画素数上限 (既定: {DEFAULT_MAX_TOTAL_PIXELS})",
+    )
+    parser.add_argument(
         "--max-file-size-mb", type=float, default=DEFAULT_MAX_FILE_SIZE_MB,
         help=f"入力PDFのファイルサイズ上限MB (既定: {DEFAULT_MAX_FILE_SIZE_MB})",
     )
     parser.add_argument(
-        "--timeout", type=float, default=None,
-        help="処理時間の上限（秒）。既定は無制限",
+        "--max-output-size-mb", type=float, default=DEFAULT_MAX_OUTPUT_SIZE_MB,
+        help=f"出力PPTXのファイルサイズ上限MB (既定: {DEFAULT_MAX_OUTPUT_SIZE_MB})",
     )
+    parser.add_argument(
+        "--timeout", type=float, default=None,
+        help="処理時間の上限（秒。ソフトタイムアウト）。既定は無制限",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     if not args.input.exists():
@@ -626,7 +795,9 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.output, dpi=args.dpi, debug_dir=args.debug_dir,
             max_pages=args.max_pages, max_dpi=args.max_dpi,
             max_page_pixels=args.max_page_pixels,
+            max_total_pixels=args.max_total_pixels,
             max_file_size_mb=args.max_file_size_mb,
+            max_output_size_mb=args.max_output_size_mb,
             timeout_seconds=args.timeout,
         )
     except Exception as e:  # noqa: BLE001 - CLIの最上位でまとめて報告する

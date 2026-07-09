@@ -34,6 +34,7 @@ OCR_INVISIBLE_TEXT = "これはOCRで生成された不可視テキストです"
 OVERLAP_ROTATED_TEXT = "縦向き文字列"
 OVERLAP_HORIZONTAL_TEXT = "重複候補テキスト"
 OVERLAP_NORMAL_TEXT = "通常の横書き行"
+FULL_IMAGE_VISIBLE_TEXT = "画像の上に載った可視テキスト"
 
 TITLE_COLOR = (0x1F / 255, 0x38 / 255, 0x64 / 255)  # 0x1F3864
 RED = (0.8, 0.1, 0.1)
@@ -176,6 +177,40 @@ def make_overlap_pdf(path: Path) -> None:
     _jp_text(page, (100, 150), OVERLAP_ROTATED_TEXT, 16, rotate=90)
     _jp_text(page, (95, 120), OVERLAP_HORIZONTAL_TEXT, 16)
     _jp_text(page, (60, 300), OVERLAP_NORMAL_TEXT, 12)
+    doc.save(path)
+    doc.close()
+
+
+def make_full_image_visible_text_pdf(path: Path) -> None:
+    """全面画像 + 可視テキストのページ（画像被覆率フォールバック検査用）。
+
+    不可視OCR層ではなく、通常の可視テキストが全面画像の上に乗っているケース。
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_W, height=A4_H)
+    img = Image.new("RGB", (400, 566), (230, 230, 225))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    page.insert_image(page.rect, stream=buf.getvalue())
+    _jp_text(page, (60, 80), FULL_IMAGE_VISIBLE_TEXT, 12)
+    doc.save(path)
+    doc.close()
+
+
+def make_extreme_page_size_pdf(path: Path) -> None:
+    """PowerPointのスライドサイズ制限(1〜56インチ)を超える極端なページサイズ。"""
+    doc = pymupdf.open()
+    # 高さ 5000pt ≈ 69.4インチ (> 56インチ上限)
+    doc.new_page(width=A4_W, height=5000.0)
+    doc.save(path)
+    doc.close()
+
+
+def make_tiny_page_size_pdf(path: Path) -> None:
+    """PowerPointのスライドサイズ制限(1〜56インチ)の下限を下回る極小ページ。"""
+    doc = pymupdf.open()
+    # 幅 36pt = 0.5インチ (< 1インチ下限)
+    doc.new_page(width=36.0, height=100.0)
     doc.save(path)
     doc.close()
 

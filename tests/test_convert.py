@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -322,7 +323,7 @@ def test_max_file_size_exceeded(tmp_path):
     pptx = tmp_path / "out.pptx"
     fx.make_business_pdf(pdf)
     with pytest.raises(ValueError, match="大きすぎます"):
-        convert.convert(pdf, pptx, max_file_size_mb=0.0)
+        convert.convert(pdf, pptx, max_file_size_mb=0.0001)
 
 
 def test_max_page_pixels_exceeded(tmp_path):
@@ -382,6 +383,162 @@ def test_image_heavy_pdf_converts_correctly(tmp_path):
     slide = Presentation(pptx).slides[0]
     assert any(fx.PAGE2_BODY in t for t in _textbox_map(slide))
     assert not any("redaction" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# hard link対策
+# ---------------------------------------------------------------------------
+
+def test_hardlink_input_output_rejected(tmp_path):
+    """resolve()では区別できないハードリンクも samefile で拒否する。"""
+    pdf = tmp_path / "in.pdf"
+    linked = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    os.link(pdf, linked)  # 同一inodeへの別名（resolve()の結果はそれぞれ異なる）
+    assert pdf.resolve() != linked.resolve()
+
+    with pytest.raises(ValueError, match="同一ファイル"):
+        convert.convert(pdf, linked)
+    # 入力ファイルが破壊されていないこと
+    assert pymupdf.open(pdf).page_count == 3
+
+
+# ---------------------------------------------------------------------------
+# debug-dir安全化
+# ---------------------------------------------------------------------------
+
+def test_debug_dir_with_existing_files_rejected(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    debug_dir = tmp_path / "debug"
+    debug_dir.mkdir()
+    (debug_dir / "stale.png").write_bytes(b"leftover")
+    fx.make_business_pdf(pdf)
+
+    with pytest.raises(ValueError, match="空ではありません"):
+        convert.convert(pdf, pptx, debug_dir=debug_dir)
+    assert not pptx.exists()
+    assert (debug_dir / "stale.png").exists()  # 既存ファイルには触れない
+
+
+def test_debug_dir_empty_or_new_is_accepted(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    debug_dir = tmp_path / "debug"  # 未作成
+    fx.make_business_pdf(pdf)
+    convert.convert(pdf, pptx, debug_dir=debug_dir)
+    assert (debug_dir / "page001_bg.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# 総リソース上限
+# ---------------------------------------------------------------------------
+
+def test_max_total_pixels_exceeded(tmp_path):
+    """1ページごとは上限内でも、全ページ合計が上限を超えれば変換前に停止する。"""
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)  # 3ページ、1ページはデフォルト上限内
+    with pytest.raises(ValueError, match="合計"):
+        convert.convert(pdf, pptx, max_total_pixels=100)
+    assert not pptx.exists()
+
+
+def test_max_output_size_exceeded_removes_file(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="出力PPTX"):
+        convert.convert(pdf, pptx, max_output_size_mb=0.0001)
+    assert not pptx.exists()  # 超過分は削除される
+
+
+# ---------------------------------------------------------------------------
+# 全面画像ページの安全フォールバック
+# ---------------------------------------------------------------------------
+
+def test_full_page_image_with_visible_text_falls_back(tmp_path):
+    """全面画像 + 可視テキストは二重写りリスクのため編集対象にしない。"""
+    pdf = tmp_path / "full_image.pdf"
+    pptx = tmp_path / "full_image.pptx"
+    fx.make_full_image_visible_text_pdf(pdf)
+    warnings = convert.convert(pdf, pptx)
+
+    slide = Presentation(pptx).slides[0]
+    assert len(slide.shapes) == 1  # 背景画像のみ
+    assert not any(fx.FULL_IMAGE_VISIBLE_TEXT in t for t in _textbox_map(slide))
+    assert any("画像で覆われています" in w for w in warnings)
+
+
+def test_image_coverage_ratio_detects_full_page_image():
+    doc = pymupdf.open()
+    page = doc.new_page(width=200, height=200)
+    from PIL import Image as PILImage
+    import io as _io
+    img = PILImage.new("RGB", (50, 50), (1, 2, 3))
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    page.insert_image(page.rect, stream=buf.getvalue())
+    ratio = convert._image_coverage_ratio(page)
+    doc.close()
+    assert ratio > 0.99
+
+
+# ---------------------------------------------------------------------------
+# 入力検証
+# ---------------------------------------------------------------------------
+
+def test_non_pdf_file_rejected(tmp_path):
+    fake = tmp_path / "not_a.pdf"
+    fake.write_bytes(b"this is not a pdf file, just plain text padding" * 10)
+    pptx = tmp_path / "out.pptx"
+    with pytest.raises(ValueError, match="PDFではないよう"):
+        convert.convert(fake, pptx)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dpi": 0},
+        {"dpi": -10},
+        {"max_pages": 0},
+        {"max_dpi": -1},
+        {"max_page_pixels": 0},
+        {"max_total_pixels": -1},
+        {"max_file_size_mb": 0},
+        {"max_output_size_mb": -5},
+    ],
+)
+def test_non_positive_limits_rejected(tmp_path, kwargs):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="正の値"):
+        convert.convert(pdf, pptx, **kwargs)
+
+
+def test_negative_timeout_rejected(tmp_path):
+    pdf = tmp_path / "in.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        convert.convert(pdf, pptx, timeout_seconds=-1.0)
+
+
+def test_extreme_large_page_size_rejected(tmp_path):
+    pdf = tmp_path / "huge.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_extreme_page_size_pdf(pdf)
+    with pytest.raises(ValueError, match="スライドサイズ制限"):
+        convert.convert(pdf, pptx)
+
+
+def test_extreme_tiny_page_size_rejected(tmp_path):
+    pdf = tmp_path / "tiny.pdf"
+    pptx = tmp_path / "out.pptx"
+    fx.make_tiny_page_size_pdf(pdf)
+    with pytest.raises(ValueError, match="スライドサイズ制限"):
+        convert.convert(pdf, pptx)
 
 
 # ---------------------------------------------------------------------------
