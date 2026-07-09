@@ -1,5 +1,7 @@
 # pdf2pptx
 
+[![Tests](https://github.com/lepoteau191/pdf-to-editable-pptx/actions/workflows/tests.yml/badge.svg)](https://github.com/lepoteau191/pdf-to-editable-pptx/actions/workflows/tests.yml)
+
 PDFを編集可能なPPTXに変換するCLIツール（自社ツール・Phase 1.2）。
 CLI（`convert.py`）に加えて、ブラウザからアップロードして変換・ダウンロードできる
 **ローカル専用のWebアップロードMVP**（`app.py`）も用意している。

@@ -21,11 +21,14 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
 - `static/index.html` … app.pyが配信する簡易アップロード画面
 - `janitor.py` … `jobs/<job_id>/` の古いジョブディレクトリを削除する掃除スクリプト
 - `tests/` … pytest。フィクスチャは `tests/fixtures_gen.py` が生成する合成PDFのみ（ネットワーク不使用）
+- `.github/workflows/tests.yml` … push/PR時にpytestをUbuntu(Python 3.10〜3.12)で自動実行するCI
 
 ## 守ること
 
 - テストは合成PDFのみ。実PDF（顧客資料等）や生成物（*.pptx）をコミットしない。
-- コード変更後は `.venv/bin/python -m pytest -q` を通す。
+- コード変更後は `.venv/bin/python -m pytest -q` を通す。CIはUbuntu上でも動くので、
+  macOS専用パスをテストフィクスチャに直書きしない（`tests/fixtures_gen.py`の
+  `_resolve_jp_font()`のように候補パス+`fc-match`フォールバックで解決する）。
 - Phase 1 の範囲: 横書き・可視のみ編集対象。縦書き・回転テキスト・回転ページ・不可視(OCR)テキスト・
   文字化けspan・それらと重なる横書き行・全面画像ページ(既定85%以上を画像が覆うページの可視テキスト)
   は背景に残す。スキャンPDFは背景のみ+警告。

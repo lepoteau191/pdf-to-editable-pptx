@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pymupdf
@@ -40,8 +43,37 @@ TITLE_COLOR = (0x1F / 255, 0x38 / 255, 0x64 / 255)  # 0x1F3864
 RED = (0.8, 0.1, 0.1)
 GRAY = (0.45, 0.45, 0.45)
 
-# PyMuPDFのpip wheelにはCJK内蔵フォントがないため、macOSのシステムフォントを使う
-JP_FONT_FILE = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+# PyMuPDFのpip wheelにはCJK内蔵フォントがないため、OS側のフォントを使う。
+# .ttc（TrueTypeコレクション）でもPyMuPDFはface 0を正しく読み込める（動作確認済み）。
+_JP_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",         # macOS
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",        # Ubuntu: fonts-noto-cjk
+    "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",            # Ubuntu: fonts-ipafont-gothic
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",           # Debian/Ubuntu (旧パッケージ名)
+]
+
+
+def _resolve_jp_font() -> str:
+    for path in _JP_FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    if shutil.which("fc-match"):
+        try:
+            result = subprocess.run(
+                ["fc-match", "-f", "%{file}", ":lang=ja"],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            if result.stdout.strip():
+                return result.stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            pass
+    raise RuntimeError(
+        "日本語(CJK)フォントが見つかりません。Linux/CIでは "
+        "`sudo apt-get install -y fonts-noto-cjk fontconfig` 等でインストールしてください。"
+    )
+
+
+JP_FONT_FILE = _resolve_jp_font()
 
 
 def _jp_text(page, point, text, size, color=(0, 0, 0), rotate=0):

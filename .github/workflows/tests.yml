@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # テストフィクスチャ(tests/fixtures_gen.py)が日本語テキストを含む合成PDFを
+      # 生成するためCJKフォントが必要。PyMuPDFのpip wheelにはCJK内蔵フォントが
+      # 無いため、OSのフォントを使う(fixtures_gen.pyのJP_FONT_FILE解決を参照)。
+      - name: Install CJK font for test fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk fontconfig
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest -q
