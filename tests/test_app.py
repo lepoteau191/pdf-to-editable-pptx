@@ -55,6 +55,9 @@ def test_index_page_serves_html(client):
     assert res.status_code == 200
     assert "text/html" in res.headers["content-type"]
     assert "pdf2pptx" in res.text
+    assert "250dpi" in res.text
+    assert "300dpi" in res.text
+    assert "OCRを試す" in res.text
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +99,35 @@ def test_upload_rejects_oversized_file(client, monkeypatch, tmp_path):
 def test_upload_missing_file_field_returns_422(client):
     res = client.post("/upload")
     assert res.status_code == 422
+
+
+def test_upload_rejects_invalid_quality(client, tmp_path):
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload",
+        data={"quality": "999999"},
+        files={"file": ("in.pdf", content, "application/pdf")},
+    )
+    assert res.status_code == 400
+    assert "画質指定が不正" in res.json()["detail"]
+    assert not app_module.JOBS_ROOT.exists() or not any(app_module.JOBS_ROOT.iterdir())
+
+
+def test_upload_rejects_ocr_when_dependency_missing(client, tmp_path, monkeypatch):
+    def _unavailable(*args, **kwargs):
+        raise ValueError("OCRを使うにはTesseractのインストールが必要です")
+
+    monkeypatch.setattr(app_module.convert, "check_ocr_available", _unavailable)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload",
+        data={"ocr": "true"},
+        files={"file": ("in.pdf", content, "application/pdf")},
+    )
+    assert res.status_code == 400
+    assert "Tesseract" in res.json()["detail"]
+    assert not app_module.JOBS_ROOT.exists() or not any(app_module.JOBS_ROOT.iterdir())
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +239,93 @@ def test_debug_dir_is_never_forwarded_to_worker(client, tmp_path, monkeypatch):
 
     assert "debug_dir" in captured
     assert captured["debug_dir"] is None
+
+
+def test_web_default_quality_uses_250dpi(client, tmp_path, monkeypatch):
+    captured = {}
+
+    def _spy(input_pdf, output_pptx, hard_timeout=None, **kwargs):
+        captured.update(kwargs)
+        return 1, "", "エラー: スパイ用の失敗"
+
+    monkeypatch.setattr(app_module.worker, "run_with_hard_timeout", _spy)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload", files={"file": ("in.pdf", content, "application/pdf")}
+    )
+    assert res.status_code == 202
+    body = res.json()
+    job_id = body["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    status = client.get(f"/jobs/{job_id}").json()
+    assert body["quality"] == "standard"
+    assert body["dpi"] == 250
+    assert status["quality"] == "standard"
+    assert status["dpi"] == 250
+    assert captured["dpi"] == 250
+    assert captured["ocr"] == app_module.convert.OCR_ENGINE_OFF
+
+
+def test_web_high_quality_uses_300dpi(client, tmp_path, monkeypatch):
+    captured = {}
+
+    def _spy(input_pdf, output_pptx, hard_timeout=None, **kwargs):
+        captured.update(kwargs)
+        return 1, "", "エラー: スパイ用の失敗"
+
+    monkeypatch.setattr(app_module.worker, "run_with_hard_timeout", _spy)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload",
+        data={"quality": "high"},
+        files={"file": ("in.pdf", content, "application/pdf")},
+    )
+    assert res.status_code == 202
+    body = res.json()
+    job_id = body["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    status = client.get(f"/jobs/{job_id}").json()
+    assert body["quality"] == "high"
+    assert body["dpi"] == 300
+    assert status["quality"] == "high"
+    assert status["dpi"] == 300
+    assert captured["dpi"] == 300
+
+
+def test_web_ocr_forwards_tesseract_to_worker(client, tmp_path, monkeypatch):
+    captured = {}
+
+    def _check_available(*args, **kwargs):
+        return None
+
+    def _spy(input_pdf, output_pptx, hard_timeout=None, **kwargs):
+        captured.update(kwargs)
+        return 1, "", "エラー: スパイ用の失敗"
+
+    monkeypatch.setattr(app_module.convert, "check_ocr_available", _check_available)
+    monkeypatch.setattr(app_module.worker, "run_with_hard_timeout", _spy)
+
+    content = _pdf_bytes(tmp_path)
+    res = client.post(
+        "/upload",
+        data={"ocr": "true"},
+        files={"file": ("in.pdf", content, "application/pdf")},
+    )
+    assert res.status_code == 202
+    body = res.json()
+    job_id = body["job_id"]
+    _wait_for_terminal(client, job_id)
+
+    status = client.get(f"/jobs/{job_id}").json()
+    assert body["ocr"] is True
+    assert status["ocr"] is True
+    assert status["ocr_lang"] == app_module.WEB_OCR_LANG
+    assert captured["ocr"] == app_module.convert.OCR_ENGINE_TESSERACT
+    assert captured["ocr_lang"] == app_module.WEB_OCR_LANG
 
 
 # ---------------------------------------------------------------------------

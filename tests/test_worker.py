@@ -24,6 +24,28 @@ def _part_path(output_pptx: Path) -> Path:
     return output_pptx.with_name(output_pptx.name + ".part")
 
 
+def test_build_child_argv_includes_ocr_options(tmp_path):
+    class Args:
+        dpi = 300
+        debug_dir = None
+        max_pages = 10
+        max_dpi = 300
+        max_page_pixels = 50_000_000
+        max_total_pixels = 100_000_000
+        max_file_size_mb = 100
+        max_output_size_mb = 300
+        timeout = None
+        ocr = "tesseract"
+        ocr_lang = "jpn+eng"
+        ocr_min_conf = 35
+        ocr_timeout = 30
+
+    argv = worker._build_child_argv(tmp_path / "in.pdf", tmp_path / "out.pptx", Args())
+    assert "--ocr" in argv
+    assert argv[argv.index("--ocr") + 1] == "tesseract"
+    assert argv[argv.index("--ocr-lang") + 1] == "jpn+eng"
+
+
 # ---------------------------------------------------------------------------
 # ハードタイムアウトのコア機構
 # ---------------------------------------------------------------------------

@@ -59,6 +59,10 @@ def _build_child_argv(input_pdf: Path, output_pptx: Path, args) -> list[str]:
     argv += ["--max-output-size-mb", str(args.max_output_size_mb)]
     if args.timeout is not None:
         argv += ["--timeout", str(args.timeout)]
+    argv += ["--ocr", str(args.ocr)]
+    argv += ["--ocr-lang", str(args.ocr_lang)]
+    argv += ["--ocr-min-conf", str(args.ocr_min_conf)]
+    argv += ["--ocr-timeout", str(args.ocr_timeout)]
     return argv
 
 
@@ -142,6 +146,10 @@ def run_with_hard_timeout(
         max_file_size_mb = convert_kwargs.get("max_file_size_mb", convert.DEFAULT_MAX_FILE_SIZE_MB)
         max_output_size_mb = convert_kwargs.get("max_output_size_mb", convert.DEFAULT_MAX_OUTPUT_SIZE_MB)
         timeout = convert_kwargs.get("timeout_seconds")
+        ocr = convert_kwargs.get("ocr", convert.DEFAULT_OCR_ENGINE)
+        ocr_lang = convert_kwargs.get("ocr_lang", convert.DEFAULT_OCR_LANG)
+        ocr_min_conf = convert_kwargs.get("ocr_min_conf", convert.DEFAULT_OCR_MIN_CONF)
+        ocr_timeout = convert_kwargs.get("ocr_timeout", convert.DEFAULT_OCR_TIMEOUT)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pdf2pptx_worker_"))
     tmp_output = tmp_dir / "output.pptx"
@@ -198,6 +206,10 @@ def main(argv: list[str] | None = None) -> int:
             max_file_size_mb=args.max_file_size_mb,
             max_output_size_mb=args.max_output_size_mb,
             timeout_seconds=args.timeout,
+            ocr=args.ocr,
+            ocr_lang=args.ocr_lang,
+            ocr_min_conf=args.ocr_min_conf,
+            ocr_timeout=args.ocr_timeout,
         )
     except (ValueError, FileNotFoundError) as e:
         print(f"エラー: {e}", file=sys.stderr)

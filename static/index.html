@@ -77,6 +77,35 @@
     color: var(--text);
     word-break: break-all;
   }
+  .options {
+    margin-top: 16px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(127, 127, 127, 0.04);
+  }
+  .options-title {
+    margin: 0 0 8px;
+    font-size: 0.84rem;
+    font-weight: 600;
+  }
+  .option {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin-top: 8px;
+    color: var(--text);
+    font-size: 0.84rem;
+    cursor: pointer;
+  }
+  .option input { margin-top: 2px; }
+  .option small {
+    display: block;
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 0.75rem;
+    line-height: 1.35;
+  }
   button {
     width: 100%;
     margin-top: 16px;
@@ -144,6 +173,31 @@
       <div class="filename" id="filename"></div>
     </label>
 
+    <div class="options" aria-label="変換画質">
+      <p class="options-title">画質</p>
+      <label class="option">
+        <input type="radio" name="quality" value="standard" checked>
+        <span>
+          標準（250dpi）
+          <small>スキャンPDFでも読みやすさを優先します。</small>
+        </span>
+      </label>
+      <label class="option">
+        <input type="radio" name="quality" value="high">
+        <span>
+          高画質（300dpi）
+          <small>細かい文字向け。変換時間とPPTXサイズは大きくなります。</small>
+        </span>
+      </label>
+      <label class="option">
+        <input type="checkbox" id="ocr-input" name="ocr" value="true">
+        <span>
+          OCRを試す（β）
+          <small>スキャンPDFの文字を編集可能テキストとして重ねます。Tesseractが必要です。</small>
+        </span>
+      </label>
+    </div>
+
     <button id="upload-btn" disabled>アップロードして変換</button>
 
     <div class="status" id="status">
@@ -164,6 +218,7 @@ const fileInput = document.getElementById("file-input");
 const dropzone = document.getElementById("dropzone");
 const dropzoneText = document.getElementById("dropzone-text");
 const filenameEl = document.getElementById("filename");
+const ocrInput = document.getElementById("ocr-input");
 const uploadBtn = document.getElementById("upload-btn");
 const statusEl = document.getElementById("status");
 const statusDot = document.getElementById("status-dot");
@@ -223,6 +278,9 @@ uploadBtn.addEventListener("click", async () => {
 
   const form = new FormData();
   form.append("file", selectedFile);
+  const quality = document.querySelector('input[name="quality"]:checked')?.value || "standard";
+  form.append("quality", quality);
+  if (ocrInput.checked) form.append("ocr", "true");
 
   let res;
   try {

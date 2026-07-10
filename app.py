@@ -34,7 +34,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 import convert
@@ -49,6 +49,17 @@ MAX_UPLOAD_SIZE_MB = convert.DEFAULT_MAX_FILE_SIZE_MB
 MAX_UPLOAD_BYTES = int(MAX_UPLOAD_SIZE_MB * 1024 * 1024)
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 HARD_TIMEOUT_SECONDS = worker.DEFAULT_HARD_TIMEOUT
+
+# Web UI向けの画質プリセット。スキャンPDFはページを背景画像としてPPTXに
+# 貼るため、150dpiでは読みにくいケースがある。ローカルPC利用ではまず
+# 250dpiを標準にし、細かい文字のPDFだけ300dpiを選べるようにする。
+# 将来OCRを入れる場合も、このdpiで生成したページ画像をOCR入力に使う。
+WEB_QUALITY_PRESETS = {
+    "standard": 250,
+    "high": 300,
+}
+DEFAULT_WEB_QUALITY = "standard"
+WEB_OCR_LANG = convert.DEFAULT_OCR_LANG
 
 # 保存するファイル名・提示するダウンロード名の長さ上限。
 # Content-Dispositionヘッダの肥大化や、極端に長いファイル名によるOS依存の
@@ -163,6 +174,22 @@ def _safe_download_name(original_filename: str | None) -> str:
     return f"{stem}.pptx"
 
 
+def _quality_to_dpi(quality: str) -> int:
+    """Web UIの画質指定を安全なdpi値へ変換する。
+
+    利用者から任意のdpi数値を受け取ると、極端な値でCPU/RAM/出力サイズを
+    膨らませられるため、Web経由では固定プリセットだけを許可する。
+    """
+    try:
+        return WEB_QUALITY_PRESETS[quality]
+    except KeyError:
+        allowed = ", ".join(sorted(WEB_QUALITY_PRESETS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"画質指定が不正です（指定可能: {allowed}）",
+        )
+
+
 # ---------------------------------------------------------------------------
 # アップロード
 # ---------------------------------------------------------------------------
@@ -189,7 +216,18 @@ async def _save_upload_streaming(file: UploadFile, dest: Path) -> None:
 
 
 @app.post("/upload", status_code=202)
-async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    quality: str = Form(DEFAULT_WEB_QUALITY),
+    ocr: bool = Form(False),
+):
+    dpi = _quality_to_dpi(quality)
+    if ocr:
+        try:
+            convert.check_ocr_available(convert.OCR_ENGINE_TESSERACT, WEB_OCR_LANG)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     original_name = file.filename or "upload.pdf"
     # 拡張子の判定は元のファイル名で行う（切り詰めた後だと拡張子を
     # 巻き込んでしまい、長いファイル名の正当なPDFを誤って拒否しうるため）。
@@ -222,23 +260,44 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
         job_id=job_id,
         status="queued",
         original_filename=original_name,
+        quality=quality,
+        dpi=dpi,
+        ocr=ocr,
+        ocr_lang=WEB_OCR_LANG if ocr else None,
         created_at=datetime.now(timezone.utc).isoformat(),
         message=None,
         warnings=[],
     )
 
-    background_tasks.add_task(_run_conversion_job, job_id)
-    return {"job_id": job_id, "status": "queued"}
+    background_tasks.add_task(_run_conversion_job, job_id, dpi, ocr)
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "quality": quality,
+        "dpi": dpi,
+        "ocr": ocr,
+    }
 
 
 # ---------------------------------------------------------------------------
 # 変換ジョブ本体（バックグラウンドで実行）
 # ---------------------------------------------------------------------------
 
-def _run_conversion_job(job_id: str) -> None:
+def _run_conversion_job(
+    job_id: str,
+    dpi: int | None = None,
+    ocr: bool | None = None,
+) -> None:
     job_dir = JOBS_ROOT / job_id
     input_path = job_dir / "input.pdf"
     output_path = job_dir / "output.pptx"
+
+    if dpi is None:
+        status = _read_status(job_dir)
+        dpi = int(status.get("dpi", WEB_QUALITY_PRESETS[DEFAULT_WEB_QUALITY]))
+    if ocr is None:
+        status = _read_status(job_dir)
+        ocr = bool(status.get("ocr", False))
 
     _write_status(job_dir, status="processing")
 
@@ -248,6 +307,9 @@ def _run_conversion_job(job_id: str) -> None:
             output_path,
             hard_timeout=HARD_TIMEOUT_SECONDS,
             debug_dir=None,  # Web経由では常に無効
+            dpi=dpi,
+            ocr=convert.OCR_ENGINE_TESSERACT if ocr else convert.OCR_ENGINE_OFF,
+            ocr_lang=WEB_OCR_LANG,
         )
     except Exception as e:  # noqa: BLE001 - ジョブを必ずerror状態へ遷移させる
         _write_status(

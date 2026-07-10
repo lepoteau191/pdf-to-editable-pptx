@@ -30,10 +30,14 @@ Web公開等を見据え、ページ数・dpi・画素数（1ページ/全ペー
 from __future__ import annotations
 
 import argparse
+import csv
 import io
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +77,18 @@ DEFAULT_MAX_PAGE_PIXELS = 50_000_000     # 背景画像1ページあたりの画
 DEFAULT_MAX_TOTAL_PIXELS = 500_000_000   # 背景画像の全ページ合計の画素数上限（約500MP）
 DEFAULT_MAX_FILE_SIZE_MB = 100.0
 DEFAULT_MAX_OUTPUT_SIZE_MB = 300.0
+
+# --- OCR（任意機能・既定OFF） ---
+# スキャンPDFを編集可能テキスト化するにはOCRが必要だが、誤認識・二重写り・
+# 依存環境差が大きいため、既定では無効。ローカルPCにTesseractが入っている
+# 場合だけ、明示オプションで有効化する。
+OCR_ENGINE_OFF = "off"
+OCR_ENGINE_TESSERACT = "tesseract"
+OCR_ENGINES = (OCR_ENGINE_OFF, OCR_ENGINE_TESSERACT)
+DEFAULT_OCR_ENGINE = OCR_ENGINE_OFF
+DEFAULT_OCR_LANG = "jpn+eng"
+DEFAULT_OCR_MIN_CONF = 35.0
+DEFAULT_OCR_TIMEOUT = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +234,218 @@ def _is_garbled(text: str) -> bool:
     if not text:
         return False
     return text.count("�") / len(text) > GARBLED_RATIO
+
+
+# ---------------------------------------------------------------------------
+# OCR（任意機能）
+# ---------------------------------------------------------------------------
+
+def _normalize_ocr_engine(engine: str) -> str:
+    engine = (engine or OCR_ENGINE_OFF).lower()
+    if engine not in OCR_ENGINES:
+        raise ValueError(
+            f"ocr は {', '.join(OCR_ENGINES)} のいずれかである必要があります: {engine}"
+        )
+    return engine
+
+
+def _tesseract_path() -> str | None:
+    return shutil.which("tesseract")
+
+
+def _split_ocr_langs(lang: str) -> list[str]:
+    return [part for part in (lang or "").split("+") if part]
+
+
+def check_ocr_available(engine: str, lang: str = DEFAULT_OCR_LANG) -> None:
+    """OCRエンジンが利用可能かを軽く検査する。
+
+    OCRは任意機能なので、offの場合は何もしない。Tesseractを使う場合は
+    コマンド本体と指定言語データが見つかるかを事前確認し、変換途中で
+    分かりにくく失敗しないようにする。
+    """
+    engine = _normalize_ocr_engine(engine)
+    if engine == OCR_ENGINE_OFF:
+        return
+
+    exe = _tesseract_path()
+    if not exe:
+        raise ValueError(
+            "OCRを使うにはTesseractのインストールが必要です。"
+            "通常変換または高画質変換はOCRなしでも利用できます"
+        )
+
+    requested = set(_split_ocr_langs(lang))
+    if not requested:
+        raise ValueError("ocr_lang は空にできません")
+
+    try:
+        res = subprocess.run(
+            [exe, "--list-langs"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Tesseract本体の存在だけは確認済み。言語一覧取得に失敗しても、
+        # 実OCR時のエラーに委ねる。
+        return
+
+    available = {
+        line.strip()
+        for line in res.stdout.splitlines()
+        if line.strip() and not line.lower().startswith("list of available")
+    }
+    missing = sorted(requested - available)
+    if missing:
+        raise ValueError(
+            "OCRに必要なTesseract言語データが見つかりません: "
+            + ", ".join(missing)
+        )
+
+
+def _parse_conf(value: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _join_ocr_parts(parts: list[str]) -> str:
+    """OCR TSVの単語断片を行テキストへまとめる。
+
+    英単語同士は空白でつなぎ、日本語などCJKを含む断片は空白を挟まずに
+    つなぐ。Tesseractの日本語出力は分かち書きが不安定なため、安全側の
+    簡易ヒューリスティックにしている。
+    """
+    out = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not out:
+            out = part
+            continue
+        if _contains_cjk(out[-1]) or _contains_cjk(part[0]):
+            out += part
+        else:
+            out += " " + part
+    return out
+
+
+def _run_tesseract_tsv(
+    image_png: bytes,
+    *,
+    lang: str,
+    timeout: float,
+) -> str:
+    exe = _tesseract_path()
+    if not exe:
+        raise RuntimeError("Tesseractが見つかりません")
+
+    with tempfile.TemporaryDirectory(prefix="pdf2pptx_ocr_") as tmp:
+        image_path = Path(tmp) / "page.png"
+        image_path.write_bytes(image_png)
+        res = subprocess.run(
+            [exe, str(image_path), "stdout", "-l", lang, "--psm", "6", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "Tesseract OCR failed").strip()
+        raise RuntimeError(f"Tesseract OCRに失敗しました: {detail}")
+    return res.stdout
+
+
+def _ocr_lines_from_tsv(
+    tsv_text: str,
+    *,
+    dpi: int,
+    min_conf: float,
+) -> list[Line]:
+    """Tesseract TSVを既存のLine形式へ変換する。
+
+    Tesseractの座標は画像ピクセル基準。render_background()と同じdpiで
+    作った画像をOCRするため、72/dpiでPDFポイント座標へ戻せる。
+    """
+    scale = PT_PER_INCH / dpi
+    grouped: dict[tuple[str, str, str], list[tuple[pymupdf.Rect, str]]] = {}
+    reader = csv.DictReader(io.StringIO(tsv_text), delimiter="\t")
+    for row in reader:
+        if row.get("level") != "5":
+            continue
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        conf = _parse_conf(row.get("conf", ""))
+        if conf >= 0 and conf < min_conf:
+            continue
+        try:
+            left = float(row["left"])
+            top = float(row["top"])
+            width = float(row["width"])
+            height = float(row["height"])
+        except (KeyError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        key = (
+            row.get("block_num", "0"),
+            row.get("par_num", "0"),
+            row.get("line_num", "0"),
+        )
+        rect = pymupdf.Rect(
+            left * scale,
+            top * scale,
+            (left + width) * scale,
+            (top + height) * scale,
+        )
+        grouped.setdefault(key, []).append((rect, text))
+
+    lines: list[Line] = []
+    for items in grouped.values():
+        if not items:
+            continue
+        bbox = pymupdf.Rect(items[0][0])
+        parts: list[str] = []
+        for rect, text in items:
+            bbox |= rect
+            parts.append(text)
+        line_text = _join_ocr_parts(parts)
+        if not line_text.strip():
+            continue
+        font_size = max(min(bbox.height * 0.78, bbox.height), 4.0)
+        lines.append(
+            Line(
+                bbox=bbox,
+                spans=[
+                    {
+                        "text": line_text,
+                        "bbox": tuple(bbox),
+                        "font": FALLBACK_JP_SANS,
+                        "size": font_size,
+                        "color": 0x000000,
+                        "flags": 0,
+                    }
+                ],
+            )
+        )
+    return lines
+
+
+def ocr_image_to_lines(
+    image_png: bytes,
+    *,
+    dpi: int,
+    lang: str = DEFAULT_OCR_LANG,
+    min_conf: float = DEFAULT_OCR_MIN_CONF,
+    timeout: float = DEFAULT_OCR_TIMEOUT,
+) -> list[Line]:
+    tsv_text = _run_tesseract_tsv(image_png, lang=lang, timeout=timeout)
+    return _ocr_lines_from_tsv(tsv_text, dpi=dpi, min_conf=min_conf)
 
 
 # get_text("dict") の既定フラグ (TEXTFLAGS_DICT) は画像ブロックの埋め込み
@@ -438,10 +666,18 @@ def _check_slide_size_limits(width_pt: float, height_pt: float) -> None:
 
 
 def process_page(
-    page: pymupdf.Page, page_no: int, dpi: int, max_page_pixels: int
+    page: pymupdf.Page,
+    page_no: int,
+    dpi: int,
+    max_page_pixels: int,
+    ocr: str = DEFAULT_OCR_ENGINE,
+    ocr_lang: str = DEFAULT_OCR_LANG,
+    ocr_min_conf: float = DEFAULT_OCR_MIN_CONF,
+    ocr_timeout: float = DEFAULT_OCR_TIMEOUT,
 ) -> PageResult:
     result = PageResult(width=page.rect.width, height=page.rect.height)
     _check_pixel_budget(page, dpi, max_page_pixels, page_no)
+    ocr = _normalize_ocr_engine(ocr)
 
     if page.rotation != 0:
         # ページ全体の回転は座標系の補正が絡むため、Phase 1では編集対象に
@@ -451,6 +687,22 @@ def process_page(
             "Phase 1では編集対象外とし、背景画像のみ出力します"
         )
         result.image_png = render_background(page, dpi)
+        if ocr == OCR_ENGINE_TESSERACT:
+            ocr_lines = ocr_image_to_lines(
+                result.image_png,
+                dpi=dpi,
+                lang=ocr_lang,
+                min_conf=ocr_min_conf,
+                timeout=ocr_timeout,
+            )
+            result.lines.extend(ocr_lines)
+            if ocr_lines:
+                result.warnings.append(
+                    f"OCRで {len(ocr_lines)} 行の編集可能テキストを追加しました"
+                    "（認識誤り・二重写りの可能性があります）"
+                )
+            else:
+                result.warnings.append("OCRを試しましたが文字を検出できませんでした")
         return result
 
     text_dict = _get_text_dict(page)
@@ -497,6 +749,22 @@ def process_page(
             )
 
     result.image_png = render_background(page, dpi)
+    if ocr == OCR_ENGINE_TESSERACT and not result.lines:
+        ocr_lines = ocr_image_to_lines(
+            result.image_png,
+            dpi=dpi,
+            lang=ocr_lang,
+            min_conf=ocr_min_conf,
+            timeout=ocr_timeout,
+        )
+        result.lines.extend(ocr_lines)
+        if ocr_lines:
+            result.warnings.append(
+                f"OCRで {len(ocr_lines)} 行の編集可能テキストを追加しました"
+                "（認識誤り・二重写りの可能性があります）"
+            )
+        else:
+            result.warnings.append("OCRを試しましたが文字を検出できませんでした")
     return result
 
 
@@ -649,6 +917,10 @@ def convert(
     max_file_size_mb: float = DEFAULT_MAX_FILE_SIZE_MB,
     max_output_size_mb: float = DEFAULT_MAX_OUTPUT_SIZE_MB,
     timeout_seconds: float | None = None,
+    ocr: str = DEFAULT_OCR_ENGINE,
+    ocr_lang: str = DEFAULT_OCR_LANG,
+    ocr_min_conf: float = DEFAULT_OCR_MIN_CONF,
+    ocr_timeout: float = DEFAULT_OCR_TIMEOUT,
 ) -> list[str]:
     """PDFをPPTXに変換する。戻り値は警告メッセージのリスト。
 
@@ -668,11 +940,17 @@ def convert(
     _check_positive("max_total_pixels", max_total_pixels)
     _check_positive("max_file_size_mb", max_file_size_mb)
     _check_positive("max_output_size_mb", max_output_size_mb)
+    _check_positive("ocr_timeout", ocr_timeout)
     if timeout_seconds is not None and timeout_seconds < 0:
         raise ValueError(f"timeout_seconds は0以上である必要があります: {timeout_seconds}")
+    if not (0 <= ocr_min_conf <= 100):
+        raise ValueError(f"ocr_min_conf は0〜100の範囲である必要があります: {ocr_min_conf}")
+    ocr = _normalize_ocr_engine(ocr)
 
     if dpi > max_dpi:
         raise ValueError(f"dpi={dpi} が上限 {max_dpi} を超えています")
+
+    check_ocr_available(ocr, ocr_lang)
 
     file_size_mb = input_pdf.stat().st_size / (1024 * 1024)
     if file_size_mb > max_file_size_mb:
@@ -729,7 +1007,16 @@ def convert(
                     f"処理時間が上限({timeout_seconds}秒)を超えました"
                     f"（{i}/{doc.page_count} ページ処理済み）"
                 )
-            pr = process_page(page, i, dpi, max_page_pixels)
+            pr = process_page(
+                page,
+                i,
+                dpi,
+                max_page_pixels,
+                ocr=ocr,
+                ocr_lang=ocr_lang,
+                ocr_min_conf=ocr_min_conf,
+                ocr_timeout=ocr_timeout,
+            )
             warnings.extend(f"ページ{i + 1}: {w}" for w in pr.warnings)
             if debug_dir:
                 debug_dir.mkdir(parents=True, exist_ok=True)
@@ -791,6 +1078,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=None,
         help="処理時間の上限（秒。ソフトタイムアウト）。既定は無制限",
     )
+    parser.add_argument(
+        "--ocr",
+        choices=OCR_ENGINES,
+        default=DEFAULT_OCR_ENGINE,
+        help=(
+            "OCRエンジン。off=OCRなし、tesseract=ローカルTesseractで"
+            f"背景のみページにOCRテキストを重ねる (既定: {DEFAULT_OCR_ENGINE})"
+        ),
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        default=DEFAULT_OCR_LANG,
+        help=f"Tesseract OCRの言語指定 (既定: {DEFAULT_OCR_LANG})",
+    )
+    parser.add_argument(
+        "--ocr-min-conf",
+        type=float,
+        default=DEFAULT_OCR_MIN_CONF,
+        help=f"OCR単語を採用する最低信頼度0〜100 (既定: {DEFAULT_OCR_MIN_CONF})",
+    )
+    parser.add_argument(
+        "--ocr-timeout",
+        type=float,
+        default=DEFAULT_OCR_TIMEOUT,
+        help=f"OCRの1ページあたりタイムアウト秒 (既定: {DEFAULT_OCR_TIMEOUT})",
+    )
     return parser
 
 
@@ -811,6 +1124,10 @@ def main(argv: list[str] | None = None) -> int:
             max_file_size_mb=args.max_file_size_mb,
             max_output_size_mb=args.max_output_size_mb,
             timeout_seconds=args.timeout,
+            ocr=args.ocr,
+            ocr_lang=args.ocr_lang,
+            ocr_min_conf=args.ocr_min_conf,
+            ocr_timeout=args.ocr_timeout,
         )
     except Exception as e:  # noqa: BLE001 - CLIの最上位でまとめて報告する
         print(f"エラー: {e}", file=sys.stderr)

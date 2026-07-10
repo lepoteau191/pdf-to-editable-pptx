@@ -485,6 +485,65 @@ def test_image_coverage_ratio_detects_full_page_image():
 
 
 # ---------------------------------------------------------------------------
+# OCR（任意機能）
+# ---------------------------------------------------------------------------
+
+def test_ocr_tsv_coordinates_are_converted_to_pdf_points():
+    tsv = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+        "left\ttop\twidth\theight\tconf\ttext\n"
+        "5\t1\t1\t1\t1\t1\t144\t72\t72\t24\t92\tHello\n"
+        "5\t1\t1\t1\t1\t2\t220\t72\t80\t24\t90\tWorld\n"
+    )
+    lines = convert._ocr_lines_from_tsv(tsv, dpi=144, min_conf=35)
+    assert len(lines) == 1
+    assert lines[0].spans[0]["text"] == "Hello World"
+    assert round(lines[0].bbox.x0, 2) == 72.0
+    assert round(lines[0].bbox.y0, 2) == 36.0
+
+
+def test_ocr_adds_editable_text_to_scan_page(tmp_path, monkeypatch):
+    pdf = tmp_path / "scan.pdf"
+    pptx = tmp_path / "scan.pptx"
+    fx.make_business_pdf(pdf)
+
+    def _available(*args, **kwargs):
+        return None
+
+    def _fake_ocr(*args, **kwargs):
+        bbox = pymupdf.Rect(60, 120, 220, 140)
+        return [
+            convert.Line(
+                bbox=bbox,
+                spans=[
+                    {
+                        "text": "OCR TEST TEXT",
+                        "bbox": tuple(bbox),
+                        "font": convert.FALLBACK_LATIN_SANS,
+                        "size": 12,
+                        "color": 0,
+                        "flags": 0,
+                    }
+                ],
+            )
+        ]
+
+    monkeypatch.setattr(convert, "check_ocr_available", _available)
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fake_ocr)
+
+    warnings = convert.convert(pdf, pptx, ocr=convert.OCR_ENGINE_TESSERACT)
+    slide3 = Presentation(pptx).slides[2]
+    assert "OCR TEST TEXT" in _textbox_map(slide3)
+    assert any("OCRで" in w for w in warnings)
+
+
+def test_ocr_missing_tesseract_is_clear(monkeypatch):
+    monkeypatch.setattr(convert.shutil, "which", lambda name: None)
+    with pytest.raises(ValueError, match="Tesseract"):
+        convert.check_ocr_available(convert.OCR_ENGINE_TESSERACT)
+
+
+# ---------------------------------------------------------------------------
 # 入力検証
 # ---------------------------------------------------------------------------
 

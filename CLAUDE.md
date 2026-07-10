@@ -8,8 +8,9 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
 
 - 環境構築: `uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt`
 - CLI実行: `.venv/bin/python convert.py input.pdf output.pptx [--dpi 150] [--debug-dir DIR]`
+- OCR付きCLI実行（Tesseract導入済みPCのみ）: `.venv/bin/python convert.py input.pdf output.pptx --dpi 300 --ocr tesseract`
 - Web公開時のハードタイムアウト実行: `.venv/bin/python worker.py input.pdf output.pptx --hard-timeout 120`
-- Webアプリ起動（ローカル）: `.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --reload`
+- Webアプリ起動（ローカル）: `.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8731 --reload`
 - ジョブディレクトリ掃除: `.venv/bin/python janitor.py --max-age-hours 24`
 - テスト: `.venv/bin/python -m pytest -q`
 
@@ -32,6 +33,10 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
 - Phase 1 の範囲: 横書き・可視のみ編集対象。縦書き・回転テキスト・回転ページ・不可視(OCR)テキスト・
   文字化けspan・それらと重なる横書き行・全面画像ページ(既定85%以上を画像が覆うページの可視テキスト)
   は背景に残す。スキャンPDFは背景のみ+警告。
+- OCRはβの任意機能。`--ocr tesseract` またはWeb UIの「OCRを試す（β）」が明示された場合だけ、
+  背景のみページへTesseract OCR結果を編集可能テキストとして重ねる。通常変換ではOCRしない。
+  Tesseract本体と `jpn`/`eng` 言語データが無い環境ではOCRだけ失敗させ、通常変換には影響させない。
+  PDF画像・OCR入力画像・OCR結果は外部送信しない。
 - `--debug-dir` は空ディレクトリのみ許可（既存ファイルがあるとエラー）。検証用であり、機密PDFや
   本番では使わない（背景画像が平文PNGでディスクに残るため）。
 - convert.py の `--timeout` はソフトタイムアウト（ページ処理の合間のみチェック）。Web公開等で
