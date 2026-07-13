@@ -30,6 +30,14 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
 - コード変更後は `.venv/bin/python -m pytest -q` を通す。CIはUbuntu上でも動くので、
   macOS専用パスをテストフィクスチャに直書きしない（`tests/fixtures_gen.py`の
   `_resolve_jp_font()`のように候補パス+`fc-match`フォールバックで解決する）。
+  フォント差異はCI環境変数`PDF2PPTX_TEST_JP_FONT`でローカル再現できる
+  （例: `PDF2PPTX_TEST_JP_FONT=/path/to/NotoSansCJK-Regular.ttc .venv/bin/python -m pytest -q`）。
+- PyMuPDFのテキスト抽出はCJKフォント依存で「見た目は同じだが別コードポイント」の
+  文字を返すことがある（ASCIIスペース→ノーブレークスペース、一部漢字→CJK互換
+  漢字等。macOSのArial Unicodeでは出ずUbuntuのNoto Sans CJKで発生、Ubuntu CIで
+  実際に踏んで判明した）。テストで抽出テキストと期待文字列を比較する箇所は
+  `tests/test_convert.py`の`_norm()`（NFKC正規化）を必ず経由する。新しいCJK
+  比較テストを足すときも同様にすること。
 - Phase 1 の範囲: 横書き・可視のみ編集対象。縦書き・回転テキスト・回転ページ・不可視(OCR)テキスト・
   文字化けspan・それらと重なる横書き行・全面画像ページ(既定85%以上を画像が覆うページの可視テキスト)
   は背景に残す。スキャンPDFは背景のみ+警告。

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import time
+import unicodedata
 from pathlib import Path
 
 import pymupdf
@@ -36,10 +36,26 @@ def business(tmp_path_factory):
     return pdf, pptx, warnings
 
 
+def _norm(s: str) -> str:
+    """比較用にテキストをNFKC正規化する。
+
+    CJKフォント(特にNoto Sans CJK等のCFF系)ではPyMuPDFのテキスト抽出が
+    フォント依存で次のような「見た目は同じだが別コードポイント」の文字を
+    返すことがある(macOSのArial Unicodeでは発生しない、Ubuntu CI環境で
+    診断して判明した既知挙動):
+      - ASCIIスペース(U+0020) -> ノーブレークスペース(U+00A0)
+      - 一部の漢字(例: 年 U+5E74) -> CJK互換漢字(例: U+F98E)
+    どちらもUnicodeのNFKC正規化で解決できる。これはconvert.py側の不具合
+    ではなく元PDFのテキスト層をそのまま反映した結果のため、convert.py側は
+    直さずテスト側の比較でのみ正規化する。
+    """
+    return unicodedata.normalize("NFKC", s)
+
+
 def _textbox_map(slide):
     """スライド内のテキストボックスを {テキスト: shape} で返す。"""
     return {
-        s.text_frame.text: s
+        _norm(s.text_frame.text): s
         for s in slide.shapes
         if s.has_text_frame and s.text_frame.text
     }
@@ -98,7 +114,7 @@ def test_position_within_tolerance(business):
 
     checked = 0
     for line in lines:
-        text = "".join(s["text"] for s in line.spans)
+        text = _norm("".join(s["text"] for s in line.spans))
         if text not in boxes:
             continue
         shape = boxes[text]
@@ -267,9 +283,13 @@ def test_overlapping_horizontal_text_left_in_background(tmp_path):
 
     slide = Presentation(pptx).slides[0]
     boxes = _textbox_map(slide)
-    assert not any(fx.OVERLAP_HORIZONTAL_TEXT in t for t in boxes)
-    assert not any(fx.OVERLAP_ROTATED_TEXT in t for t in boxes)
-    assert any(fx.OVERLAP_NORMAL_TEXT in t for t in boxes)
+    assert not any(fx.OVERLAP_HORIZONTAL_TEXT in t for t in boxes), list(boxes)
+    assert not any(fx.OVERLAP_ROTATED_TEXT in t for t in boxes), list(boxes)
+    # フォント(特にCFF系CJKフォント)によっては行が複数spanに分割されて
+    # 抽出されることがあるため、単一ボックスへの部分一致ではなく
+    # 全ボックスを連結したテキストに対して判定する（診断用に一覧も表示）。
+    all_text = "".join(boxes)
+    assert fx.OVERLAP_NORMAL_TEXT in all_text, list(boxes)
     assert any("重なる" in w for w in warnings)
     assert not any("redaction" in w for w in warnings)
 
@@ -363,12 +383,12 @@ def test_image_heavy_pdf_text_dict_excludes_images(tmp_path):
     doc = pymupdf.open(pdf)
     page = doc[0]
 
-    start = time.monotonic()
     d = convert._get_text_dict(page)
-    elapsed = time.monotonic() - start
 
+    # 実行時間のassertは共有CIランナーで揺れるため行わず、画像ブロックが
+    # 実際に混入していないこと（TEXT_PRESERVE_IMAGESを外した効果）だけを
+    # 確定的に検証する。
     assert not any(b["type"] == 1 for b in d["blocks"])  # 画像ブロックが無い
-    assert elapsed < 3.0  # 画像埋め込みがあれば大幅に遅くなるはずの緩い上限
 
     lines, _ = convert.extract_editable_lines(page, text_dict=d)
     assert any(fx.PAGE2_BODY in "".join(s["text"] for s in line.spans) for line in lines)

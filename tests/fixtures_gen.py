@@ -54,6 +54,12 @@ _JP_FONT_CANDIDATES = [
 
 
 def _resolve_jp_font() -> str:
+    # 環境変数での明示的な上書き（CI差異の再現・診断や、候補にないフォント
+    # 環境での手動指定に使う）。存在しないパスが指定された場合は無視して
+    # 通常の解決フローに進む。
+    override = os.environ.get("PDF2PPTX_TEST_JP_FONT")
+    if override and os.path.exists(override):
+        return override
     for path in _JP_FONT_CANDIDATES:
         if os.path.exists(path):
             return path
