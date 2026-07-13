@@ -232,6 +232,24 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
+### Tesseractのインストール（開発者・OCR機能を試す場合）
+
+OCRβ機能（`--ocr tesseract`）はPythonパッケージではなく、OS側にTesseract本体と
+日本語/英語の言語データが必要。テストはOCR呼び出しをモック化しているため
+`pytest`にTesseractは不要だが、実際にOCRを動かして試すには次のいずれかを
+インストールする。
+
+```bash
+# macOS (Homebrew)
+brew install tesseract tesseract-lang   # tesseract-langに日本語(jpn)を含む
+
+# Ubuntu / Debian
+sudo apt-get install -y tesseract-ocr tesseract-ocr-jpn
+```
+
+インストール後、`tesseract --list-langs` の出力に `jpn` と `eng` が含まれるか確認する。
+含まれない場合はOCRの言語指定（既定 `--ocr-lang jpn+eng`）に合う言語データを追加する。
+
 ## 使い方
 
 ```bash
