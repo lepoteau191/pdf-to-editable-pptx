@@ -563,6 +563,97 @@ def test_ocr_missing_tesseract_is_clear(monkeypatch):
         convert.check_ocr_available(convert.OCR_ENGINE_TESSERACT)
 
 
+def test_ocr_skips_full_page_image_with_visible_text(tmp_path, monkeypatch):
+    """全面画像＋可視テキストのページはOCRしても二重写りになるためスキップする。"""
+    pdf = tmp_path / "full_image.pdf"
+    pptx = tmp_path / "full_image.pptx"
+    fx.make_full_image_visible_text_pdf(pdf)
+
+    def _available(*args, **kwargs):
+        return None
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("可視テキストがあるページでOCRが呼ばれてはいけない")
+
+    monkeypatch.setattr(convert, "check_ocr_available", _available)
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fail_if_called)
+
+    warnings = convert.convert(pdf, pptx, ocr=convert.OCR_ENGINE_TESSERACT)
+    slide = Presentation(pptx).slides[0]
+    assert len(slide.shapes) == 1  # 背景画像のみ（OCRテキストボックスは追加されない）
+    assert any("スキップ" in w for w in warnings)
+
+
+def test_ocr_skips_rotated_page_with_visible_text(tmp_path, monkeypatch):
+    """回転ページに可視テキストが既にある場合もOCRはスキップする。"""
+    pdf = tmp_path / "rot.pdf"
+    pptx = tmp_path / "rot.pptx"
+    fx.make_rotated_page_pdf(pdf)
+
+    def _available(*args, **kwargs):
+        return None
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("可視テキストがあるページでOCRが呼ばれてはいけない")
+
+    monkeypatch.setattr(convert, "check_ocr_available", _available)
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fail_if_called)
+
+    warnings = convert.convert(pdf, pptx, ocr=convert.OCR_ENGINE_TESSERACT)
+    slide = Presentation(pptx).slides[0]
+    assert len(slide.shapes) == 1
+    assert any("スキップ" in w for w in warnings)
+
+
+def test_ocr_timeout_capped_by_remaining_soft_timeout(tmp_path, monkeypatch):
+    """OCRの1ページタイムアウトは、全体のソフトタイムアウト残り時間で頭打ちにする。
+
+    そうしないと、ocr_timeoutが大きい場合に1ページのOCRだけでtimeout_seconds
+    を大きく超過してしまい、CLI/workerの処理時間の予測可能性が崩れる。
+    """
+    pdf = tmp_path / "scan.pdf"
+    pptx = tmp_path / "scan.pptx"
+    fx.make_invisible_ocr_pdf(pdf)  # 1ページ・可視テキストなし(OCR対象)
+
+    captured = {}
+
+    def _available(*args, **kwargs):
+        return None
+
+    def _fake_ocr(image_png, *, dpi, lang, min_conf, timeout):
+        captured["timeout"] = timeout
+        return []
+
+    monkeypatch.setattr(convert, "check_ocr_available", _available)
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fake_ocr)
+
+    convert.convert(
+        pdf, pptx, ocr=convert.OCR_ENGINE_TESSERACT,
+        timeout_seconds=5.0, ocr_timeout=30.0,
+    )
+    assert 0 < captured["timeout"] <= 5.0
+
+
+def test_maybe_run_ocr_skips_when_timeout_non_positive(monkeypatch):
+    """残り時間ベースのocr_timeoutが0以下になった場合はOCR自体を安全にスキップする。
+
+    convert.convert()経由だとtimeout_seconds=0はページ処理前にTimeoutErrorに
+    なってしまい狙った分岐に届かないため、_maybe_run_ocrを直接検証する。
+    """
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("ocr_timeout<=0の場合はOCRが呼ばれてはいけない")
+
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fail_if_called)
+
+    result = convert.PageResult(width=595.0, height=842.0)
+    convert._maybe_run_ocr(
+        result, convert.OCR_ENGINE_TESSERACT, False,
+        150, "jpn+eng", 35.0, 0.0,
+    )
+    assert any("スキップ" in w for w in result.warnings)
+    assert result.lines == []
+
+
 # ---------------------------------------------------------------------------
 # 入力検証
 # ---------------------------------------------------------------------------

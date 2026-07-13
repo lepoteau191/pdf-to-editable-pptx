@@ -24,6 +24,39 @@ def _part_path(output_pptx: Path) -> Path:
     return output_pptx.with_name(output_pptx.name + ".part")
 
 
+def test_run_with_hard_timeout_sets_child_tmpdir(tmp_path, monkeypatch):
+    """子プロセスのTMPDIR/TMP/TEMPをworker管理下のtmp_dir配下へ固定する。
+
+    ハードタイムアウトでSIGKILLされ子プロセス側のcleanupが走らなくても、
+    OCR等が作る一時ファイルがworkerのtmp_dir配下に収まっていれば、
+    run_with_hard_timeout自身のshutil.rmtree(tmp_dir)で確実に消せる。
+    """
+    pdf = tmp_path / "in.pdf"
+    out = tmp_path / "out.pptx"
+    fx.make_business_pdf(pdf)
+
+    captured = {}
+
+    def _fake_run_subprocess(argv, hard_timeout, env=None):
+        # cleanup(shutil.rmtree)が走る前に実在確認する
+        captured["env"] = dict(env) if env else None
+        if env:
+            for key in ("TMPDIR", "TMP", "TEMP"):
+                assert Path(env[key]).is_dir(), f"{key} が実在しない: {env[key]}"
+        return 1, "", "エラー: テスト用に意図的に失敗させた", False
+
+    monkeypatch.setattr(worker, "run_subprocess_with_hard_timeout", _fake_run_subprocess)
+
+    worker.run_with_hard_timeout(pdf, out, hard_timeout=30.0)
+
+    env = captured["env"]
+    assert env is not None
+    assert env["TMPDIR"] == env["TMP"] == env["TEMP"]
+    assert "pdf2pptx_worker_" in env["TMPDIR"]
+    # PATH等、他の環境変数はそのまま引き継がれていること
+    assert env.get("PATH") == os.environ.get("PATH")
+
+
 def test_build_child_argv_includes_ocr_options(tmp_path):
     class Args:
         dpi = 300

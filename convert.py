@@ -35,6 +35,7 @@ import io
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -347,17 +348,28 @@ def _run_tesseract_tsv(
     with tempfile.TemporaryDirectory(prefix="pdf2pptx_ocr_") as tmp:
         image_path = Path(tmp) / "page.png"
         image_path.write_bytes(image_png)
-        res = subprocess.run(
-            [exe, str(image_path), "stdout", "-l", lang, "--psm", "6", "tsv"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        argv = [exe, str(image_path), "stdout", "-l", lang, "--psm", "6", "tsv"]
+        # worker.pyのハードタイムアウトkill(os.killpg)と同じ考え方で、
+        # このタイムアウトも子プロセスだけでなくプロセスグループ全体を
+        # 対象にする（Tesseractが内部で子プロセスを起動しても残さないため）。
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
-    if res.returncode != 0:
-        detail = (res.stderr or res.stdout or "Tesseract OCR failed").strip()
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise RuntimeError(f"Tesseract OCRがタイムアウトしました（{timeout}秒）")
+        returncode = proc.returncode
+    if returncode != 0:
+        detail = (stderr or stdout or "Tesseract OCR failed").strip()
         raise RuntimeError(f"Tesseract OCRに失敗しました: {detail}")
-    return res.stdout
+    return stdout
 
 
 def _ocr_lines_from_tsv(
@@ -665,6 +677,51 @@ def _check_slide_size_limits(width_pt: float, height_pt: float) -> None:
         )
 
 
+def _maybe_run_ocr(
+    result: PageResult,
+    ocr: str,
+    any_visible: bool,
+    dpi: int,
+    ocr_lang: str,
+    ocr_min_conf: float,
+    ocr_timeout: float,
+) -> None:
+    """条件を満たす場合のみOCRを実行し、結果をresultに反映する。
+
+    any_visible（そのページに何らかの可視テキストが既に存在するか）を
+    唯一の判定基準にする。回転ページ・全面画像ページ・スキャンページの
+    いずれであっても、既に可視テキストがある場合はOCR文字を重ねると
+    二重写りになるため、その場合は必ずスキップする。
+    """
+    if ocr != OCR_ENGINE_TESSERACT:
+        return
+    if any_visible:
+        result.warnings.append(
+            "既に可視テキストが含まれるため、二重写り防止のためOCRをスキップしました"
+        )
+        return
+    if ocr_timeout <= 0:
+        result.warnings.append(
+            "処理時間の上限に近いためOCRをスキップしました（ページ処理は継続します）"
+        )
+        return
+    ocr_lines = ocr_image_to_lines(
+        result.image_png,
+        dpi=dpi,
+        lang=ocr_lang,
+        min_conf=ocr_min_conf,
+        timeout=ocr_timeout,
+    )
+    result.lines.extend(ocr_lines)
+    if ocr_lines:
+        result.warnings.append(
+            f"OCRで {len(ocr_lines)} 行の編集可能テキストを追加しました"
+            "（認識誤り・二重写りの可能性があります）"
+        )
+    else:
+        result.warnings.append("OCRを試しましたが文字を検出できませんでした")
+
+
 def process_page(
     page: pymupdf.Page,
     page_no: int,
@@ -679,6 +736,12 @@ def process_page(
     _check_pixel_budget(page, dpi, max_page_pixels, page_no)
     ocr = _normalize_ocr_engine(ocr)
 
+    # 回転ページ・通常ページのどちらでも、OCRの可否判定に可視テキストの
+    # 有無が必要なため、ここで一度だけ抽出する（TEXT_PRESERVE_IMAGESは
+    # 既に外してあるため画像データは含まれない）。
+    text_dict = _get_text_dict(page)
+    any_visible, any_invisible = _text_visibility(text_dict)
+
     if page.rotation != 0:
         # ページ全体の回転は座標系の補正が絡むため、Phase 1では編集対象に
         # せず安全側に倒す（背景画像はMuPDFが回転込みで正しく描画する）。
@@ -687,26 +750,9 @@ def process_page(
             "Phase 1では編集対象外とし、背景画像のみ出力します"
         )
         result.image_png = render_background(page, dpi)
-        if ocr == OCR_ENGINE_TESSERACT:
-            ocr_lines = ocr_image_to_lines(
-                result.image_png,
-                dpi=dpi,
-                lang=ocr_lang,
-                min_conf=ocr_min_conf,
-                timeout=ocr_timeout,
-            )
-            result.lines.extend(ocr_lines)
-            if ocr_lines:
-                result.warnings.append(
-                    f"OCRで {len(ocr_lines)} 行の編集可能テキストを追加しました"
-                    "（認識誤り・二重写りの可能性があります）"
-                )
-            else:
-                result.warnings.append("OCRを試しましたが文字を検出できませんでした")
+        _maybe_run_ocr(result, ocr, any_visible, dpi, ocr_lang, ocr_min_conf, ocr_timeout)
         return result
 
-    text_dict = _get_text_dict(page)
-    any_visible, any_invisible = _text_visibility(text_dict)
     image_coverage = _image_coverage_ratio(page)
     full_page_image = image_coverage >= FULL_IMAGE_COVERAGE_THRESHOLD
 
@@ -749,22 +795,7 @@ def process_page(
             )
 
     result.image_png = render_background(page, dpi)
-    if ocr == OCR_ENGINE_TESSERACT and not result.lines:
-        ocr_lines = ocr_image_to_lines(
-            result.image_png,
-            dpi=dpi,
-            lang=ocr_lang,
-            min_conf=ocr_min_conf,
-            timeout=ocr_timeout,
-        )
-        result.lines.extend(ocr_lines)
-        if ocr_lines:
-            result.warnings.append(
-                f"OCRで {len(ocr_lines)} 行の編集可能テキストを追加しました"
-                "（認識誤り・二重写りの可能性があります）"
-            )
-        else:
-            result.warnings.append("OCRを試しましたが文字を検出できませんでした")
+    _maybe_run_ocr(result, ocr, any_visible, dpi, ocr_lang, ocr_min_conf, ocr_timeout)
     return result
 
 
@@ -999,14 +1030,19 @@ def convert(
         # 各ページの背景画像を溜め込まず、都度スライドに追加してから破棄する
         # （全ページ分をメモリに保持するピーク使用量を抑えるため）。
         for i, page in enumerate(doc):
-            if (
-                timeout_seconds is not None
-                and time.monotonic() - start_time > timeout_seconds
-            ):
-                raise TimeoutError(
-                    f"処理時間が上限({timeout_seconds}秒)を超えました"
-                    f"（{i}/{doc.page_count} ページ処理済み）"
-                )
+            page_ocr_timeout = ocr_timeout
+            if timeout_seconds is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout_seconds:
+                    raise TimeoutError(
+                        f"処理時間が上限({timeout_seconds}秒)を超えました"
+                        f"（{i}/{doc.page_count} ページ処理済み）"
+                    )
+                # OCRは1ページで最大ocr_timeout秒かかりうるため、そのままだと
+                # 全体のソフトタイムアウトを大きく超過しうる。残り時間で
+                # 上限をかけ、OCRだけが原因で全体の予測可能性が崩れないようにする。
+                remaining = timeout_seconds - elapsed
+                page_ocr_timeout = max(min(ocr_timeout, remaining), 0.0)
             pr = process_page(
                 page,
                 i,
@@ -1015,7 +1051,7 @@ def convert(
                 ocr=ocr,
                 ocr_lang=ocr_lang,
                 ocr_min_conf=ocr_min_conf,
-                ocr_timeout=ocr_timeout,
+                ocr_timeout=page_ocr_timeout,
             )
             warnings.extend(f"ページ{i + 1}: {w}" for w in pr.warnings)
             if debug_dir:

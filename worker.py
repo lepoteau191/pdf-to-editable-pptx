@@ -67,7 +67,7 @@ def _build_child_argv(input_pdf: Path, output_pptx: Path, args) -> list[str]:
 
 
 def run_subprocess_with_hard_timeout(
-    argv: list[str], hard_timeout: float
+    argv: list[str], hard_timeout: float, env: dict[str, str] | None = None
 ) -> tuple[int, str, str, bool]:
     """任意のコマンドをhard_timeout秒でプロセスグループごとSIGKILLしながら実行する。
 
@@ -75,10 +75,12 @@ def run_subprocess_with_hard_timeout(
     `start_new_session=True` で子を新しいプロセスグループのリーダーにし、
     タイムアウト時は `os.killpg` でグループ全体（孫プロセスを含む）を
     強制終了する。戻り値は (returncode, stdout, stderr, timed_out)。
+    `env` を渡すと子プロセスの環境変数を上書きできる（省略時は現在の
+    環境をそのまま継承する）。
     """
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True,
+        start_new_session=True, env=env,
     )
     timed_out = False
     try:
@@ -155,8 +157,20 @@ def run_with_hard_timeout(
     tmp_output = tmp_dir / "output.pptx"
     argv = _build_child_argv(input_pdf, tmp_output, _Args())
 
+    # 子プロセスのTMPDIR/TMP/TEMPをこのworkerが管理するtmp_dir配下へ固定する。
+    # OCR(_run_tesseract_tsv等)が作る一時ファイルもここに収まるため、
+    # ハードタイムアウトでSIGKILLされて子プロセス側のcleanupが走らなくても、
+    # 後段のshutil.rmtree(tmp_dir)でまとめて確実に削除できる
+    # （機密PDFのページ画像が/tmp直下に残り続けるのを防ぐ）。
+    child_tmp_dir = tmp_dir / "tmp"
+    child_tmp_dir.mkdir()
+    child_env = os.environ.copy()
+    child_env["TMPDIR"] = str(child_tmp_dir)
+    child_env["TMP"] = str(child_tmp_dir)
+    child_env["TEMP"] = str(child_tmp_dir)
+
     returncode, stdout, stderr, timed_out = run_subprocess_with_hard_timeout(
-        argv, hard_timeout
+        argv, hard_timeout, env=child_env
     )
     if timed_out:
         stderr += (
