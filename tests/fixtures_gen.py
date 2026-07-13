@@ -180,6 +180,25 @@ def make_rotated_page_pdf(path: Path) -> None:
     doc.close()
 
 
+def make_rotated_page_scan_pdf(path: Path) -> None:
+    """回転ページ(/Rotate 90) + 可視テキストなし（画像のみ）。
+
+    OCR対象（any_visible=False）になる回転ページを作るための、
+    make_rotated_page_pdf とは別のフィクスチャ。OCR結果の座標が
+    回転後のページ座標系（page.rectは回転を反映した幅・高さを返す）で
+    正しく扱われることを検証するのに使う。
+    """
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_W, height=A4_H)
+    img = Image.new("RGB", (400, 566), (235, 235, 230))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    page.insert_image(page.rect, stream=buf.getvalue())
+    page.set_rotation(90)
+    doc.save(path)
+    doc.close()
+
+
 def make_small_mixed_pdf(path: Path) -> None:
     """ページサイズ混在: 通常ページ + より小さいページ（拡大されないことの検証用）。"""
     doc = pymupdf.open()

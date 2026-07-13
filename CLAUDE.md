@@ -51,7 +51,11 @@ CLIに加えて、ブラウザアップロード用のローカル専用FastAPI 
   （既にある文字にOCR文字を重ねると二重写りになるため）。OCR実行条件を変える
   ときは、この一本化した判定を崩さないこと（Codexレビューで、回転/全面画像の
   「背景のみ」警告とOCR追加が両立してしまいOCR時だけ二重写りが起きる不具合が
-  見つかり修正済み）。
+  見つかり修正済み）。回転ページでは`page.rect`が`/Rotate`を反映した幅・
+  高さ（90度回転なら元の幅と高さが入れ替わる）を返し、背景画像もその向きで
+  レンダリングされるため、OCR側で回転専用の座標補正は不要（ピクセル座標を
+  72/dpiでpt変換するだけで正しい）。この前提は
+  `test_ocr_places_text_correctly_on_rotated_page`で検証済み。
 - Tesseractのサブプロセスもworker.pyと同じ考え方（`start_new_session=True` +
   タイムアウト時`os.killpg`）でプロセスグループごと止める（`_run_tesseract_tsv`）。
   OCRの1ページタイムアウト(`ocr_timeout`)は、convert()の全体ソフトタイムアウト

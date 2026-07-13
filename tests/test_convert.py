@@ -634,6 +634,66 @@ def test_ocr_timeout_capped_by_remaining_soft_timeout(tmp_path, monkeypatch):
     assert 0 < captured["timeout"] <= 5.0
 
 
+def test_ocr_places_text_correctly_on_rotated_page(tmp_path, monkeypatch):
+    """回転ページ(/Rotate 90)でもOCRテキストが回転後の座標系で正しく配置される。
+
+    page.rect は /Rotate を反映した幅・高さ（90度回転なら元の幅と高さが
+    入れ替わる）を返し、背景画像もその向きでレンダリングされる。OCRは
+    その背景画像のピクセル座標を72/dpiでpt変換するだけなので、回転専用の
+    座標補正コードを書かなくても正しく重なるはずである。それを裏付けるため、
+    元ページ(595x842)の幅を超え、回転後の幅(842x595)には収まる位置
+    (x0=700pt)にOCR結果を配置し、回転を考慮せず元の座標系のまま扱われて
+    いたら検出できるようにする。
+    """
+    pdf = tmp_path / "rotated_scan.pdf"
+    pptx = tmp_path / "rotated_scan.pptx"
+    fx.make_rotated_page_scan_pdf(pdf)
+
+    doc = pymupdf.open(pdf)
+    rotated_rect = doc[0].rect
+    doc.close()
+    assert (rotated_rect.width, rotated_rect.height) == (842.0, 595.0)
+
+    ocr_bbox = pymupdf.Rect(700, 50, 780, 75)  # x0=700 は元の幅595ptを超える
+
+    def _available(*args, **kwargs):
+        return None
+
+    def _fake_ocr(*args, **kwargs):
+        return [
+            convert.Line(
+                bbox=ocr_bbox,
+                spans=[
+                    {
+                        "text": "ROTATED OCR TEXT",
+                        "bbox": tuple(ocr_bbox),
+                        "font": convert.FALLBACK_LATIN_SANS,
+                        "size": 12,
+                        "color": 0,
+                        "flags": 0,
+                    }
+                ],
+            )
+        ]
+
+    monkeypatch.setattr(convert, "check_ocr_available", _available)
+    monkeypatch.setattr(convert, "ocr_image_to_lines", _fake_ocr)
+
+    warnings = convert.convert(pdf, pptx, ocr=convert.OCR_ENGINE_TESSERACT)
+    assert not any("スキップ" in w for w in warnings)
+    assert any("OCRで" in w for w in warnings)
+
+    prs = Presentation(pptx)
+    assert prs.slide_width == round(842.0 * EMU_PER_PT)
+    assert prs.slide_height == round(595.0 * EMU_PER_PT)
+
+    slide = prs.slides[0]
+    box = _find_box(slide, "ROTATED OCR TEXT")
+    # ページ1枚のみ(スライドサイズ=ページサイズ)なので scale=1.0, dx=dy=0
+    assert box.left == round(ocr_bbox.x0 * EMU_PER_PT)
+    assert box.top == round(ocr_bbox.y0 * EMU_PER_PT)
+
+
 def test_maybe_run_ocr_skips_when_timeout_non_positive(monkeypatch):
     """残り時間ベースのocr_timeoutが0以下になった場合はOCR自体を安全にスキップする。
 
